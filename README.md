@@ -14,7 +14,7 @@ EDIR is an automated eye disease classification system that analyzes ocular imag
 
 | Folder | Description |
 |--------|-------------|
-| **art** | Artifacts: input and output. Raw/clean datasets (`art/raw`, `art/clean` with `train`/`validate`), and later figures, models, logs. |
+| **art** | Artifacts: input and output. Datasets (`art/data/raw`, `art/data/clean` with `train`/`validate`), reports (`art/report/profiling`), and later figures, models, logs. |
 | **doc** | Project documentation (notes, reports, specs). |
 | **nbs** | Jupyter notebooks for exploration, preprocessing, and experiments. |
 | **ref** | Reference material (e.g. `brain_tumour.ipynb` as reference for this project). |
@@ -70,30 +70,32 @@ This installs everything in `pyproject.toml` (Jupyter, numpy, pandas, matplotlib
 
 ### 3. Set up the artifact directory and data
 
-The project expects input data under `art/raw/`. You must create the folders and add the dataset.
+The project expects input data under `art/data/raw/`. You must create the folders and add the dataset.
 
 **Directory layout:**
 
 | Folder | Purpose |
 |--------|---------|
-| `art/raw/train` | Training images (one subfolder per class). |
-| `art/raw/validate` | Validation images (one subfolder per class). |
+| `art/data/raw/train` | Training images (one subfolder per class). |
+| `art/data/raw/validate` | Validation images (one subfolder per class). |
+| `art/data/clean` | Cleaned/processed images (populated later). |
+| `art/report/profiling` | ydata-profiling HTML reports. |
 
 **Get the data (links shared by mentor):**
 
-1. **Train data** — [Download](https://drive.google.com/drive/folders/16uCYQS4-AiZrz4Jp6dXt9meM2QHh4JRv) and put the contents into `art/raw/train` (so that class folders e.g. `cataract`, `glaucoma`, `diabetic_retinopathy`, `normal` are directly inside `art/raw/train`).
-2. **Validate data** — [Download](https://drive.google.com/drive/folders/1FwfXqTUIVcTZtf3bxIbDF5L0B2JeT5mv) and put the contents into `art/raw/validate`.
+1. **Train data** — [Download](https://drive.google.com/drive/folders/16uCYQS4-AiZrz4Jp6dXt9meM2QHh4JRv) and put the contents into `art/data/raw/train` (so that class folders e.g. `cataract`, `glaucoma`, `diabetic_retinopathy`, `normal` are directly inside `art/data/raw/train`).
+2. **Validate data** — [Download](https://drive.google.com/drive/folders/1FwfXqTUIVcTZtf3bxIbDF5L0B2JeT5mv) and put the contents into `art/data/raw/validate`.
 
 **Create the folders if they don’t exist:**
 
 ```bash
 # Linux / macOS / Git Bash
-mkdir -p art/raw/train art/raw/validate
+mkdir -p art/data/raw/train art/data/raw/validate
 ```
 
 ```powershell
 # Windows PowerShell
-New-Item -ItemType Directory -Force -Path art/raw/train, art/raw/validate
+New-Item -ItemType Directory -Force -Path art/data/raw/train, art/data/raw/validate
 ```
 
 Then copy or extract the downloaded data into the correct folders.

@@ -13,6 +13,9 @@ wheels/
 # Jupyter
 .ipynb_checkpoints/
 
-# Artifacts
-art/raw/*
-art/clean/*
+# Artifacts — ignore data contents but keep directory structure via .gitkeep
+art/data/raw/*
+!art/data/raw/.gitkeep
+art/data/clean/*
+!art/data/clean/.gitkeep
+

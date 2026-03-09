@@ -3,15 +3,18 @@ name = "edir"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.12"
 dependencies = [
+    "setuptools~=81.0",
+    "ydata-profiling>=4.6.0",
     "imagehash>=4.3.2",
     "jupyter>=1.1.1",
-    "matplotlib>=3.10.8",
-    "numpy>=2.4.2",
+    "matplotlib>=3.5,<=3.10",
+    "numpy>=1.22,<2.4",
     "opencv-python>=4.13.0.92",
-    "pandas>=3.0.1",
+    "pandas==2.3.3",
     "pillow>=12.1.1",
-    "seaborn>=0.13.2",
+    "seaborn>=0.10.1,<0.14",
     "tqdm>=4.67.3",
+    "cleanvision>=0.3.6",
 ]
