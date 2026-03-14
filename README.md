@@ -14,11 +14,29 @@ EDIR is an automated eye disease classification system that analyzes ocular imag
 
 | Folder | Description |
 |--------|-------------|
-| **art** | Artifacts: input and output. Datasets (`art/data/raw`, `art/data/clean` with `train`/`validate`), reports (`art/report/profiling`), and later figures, models, logs. |
+| **art** | Artifacts: input and output. Data is organized by variant (**rgb** or **grey**). Each variant has its own `data`, `csv`, and `report` under `art/<variant>/` (e.g. `art/rgb/data/raw`, `art/grey/csv/raw`). See [Data layout (art/)](#data-layout-art) below. |
 | **doc** | Project documentation (notes, reports, specs). |
 | **nbs** | Jupyter notebooks for exploration, preprocessing, and experiments. |
 | **ref** | Reference material (e.g. `brain_tumour.ipynb` as reference for this project). |
 | **src** | Reusable Python package and scripts; importable from notebooks and elsewhere after `uv sync`. |
+
+### Data layout (art/)
+
+Data and outputs are split by variant so RGB and greyscale pipelines stay separate:
+
+| Path | Purpose |
+|------|---------|
+| `art/rgb/data/raw/train`, `art/rgb/data/raw/validate` | Raw RGB images (one subfolder per class). |
+| `art/rgb/data/clean/...` | Cleaned/processed RGB images. |
+| `art/rgb/csv/raw` | Manifest CSV for raw RGB (e.g. `image_manifest.csv`). |
+| `art/rgb/csv/clean` | Manifest CSV for cleaned RGB (optional). |
+| `art/rgb/report` | Reports and profiling for RGB (e.g. `report/profiling`). |
+| `art/grey/data/raw/...` | Raw greyscale images. |
+| `art/grey/data/clean/...` | Cleaned greyscale images. |
+| `art/grey/csv/raw`, `art/grey/csv/clean` | CSV manifests for grey variant. |
+| `art/grey/report` | Reports for grey variant. |
+
+In the notebook (`nbs/eye_disease_v3_506.ipynb`), set `DATA_VARIANT = "rgb"` or `DATA_VARIANT = "grey"` in the Setup section to point at the desired variant.
 
 ## Setup
 
@@ -70,32 +88,33 @@ This installs everything in `pyproject.toml` (Jupyter, numpy, pandas, matplotlib
 
 ### 3. Set up the artifact directory and data
 
-The project expects input data under `art/data/raw/`. You must create the folders and add the dataset.
+The project expects input data under `art/<variant>/data/raw/`, where `<variant>` is **rgb** or **grey**. Each variant has its own `data`, `csv`, and `report` folders. Create the folders for the variant you use (e.g. `art/rgb/`) and add the dataset there.
 
 **Directory layout:**
 
 | Folder | Purpose |
 |--------|---------|
-| `art/data/raw/train` | Training images (one subfolder per class). |
-| `art/data/raw/validate` | Validation images (one subfolder per class). |
-| `art/data/clean` | Cleaned/processed images (populated later). |
-| `art/report/profiling` | ydata-profiling HTML reports. |
+| `art/rgb/data/raw/train` | Training images (one subfolder per class). |
+| `art/rgb/data/raw/validate` | Validation images (one subfolder per class). |
+| `art/rgb/data/clean` | Cleaned/processed images (populated later). |
+| `art/rgb/csv/raw` | Manifest CSV for raw data. |
+| `art/rgb/report` | Reports (e.g. profiling). Use `art/grey/...` for greyscale; set `DATA_VARIANT` in the notebook. |
 
 **Get the data (links shared by mentor):**
 
-1. **Train data** — [Download](https://drive.google.com/drive/folders/16uCYQS4-AiZrz4Jp6dXt9meM2QHh4JRv) and put the contents into `art/data/raw/train` (so that class folders e.g. `cataract`, `glaucoma`, `diabetic_retinopathy`, `normal` are directly inside `art/data/raw/train`).
-2. **Validate data** — [Download](https://drive.google.com/drive/folders/1FwfXqTUIVcTZtf3bxIbDF5L0B2JeT5mv) and put the contents into `art/data/raw/validate`.
+1. **Train data** — [Download](https://drive.google.com/drive/folders/16uCYQS4-AiZrz4Jp6dXt9meM2QHh4JRv) and put the contents into `art/rgb/data/raw/train` (so that class folders e.g. `cataract`, `glaucoma`, `diabetic_retinopathy`, `normal` are directly inside `art/data/raw/train`).
+2. **Validate data** — [Download](https://drive.google.com/drive/folders/1FwfXqTUIVcTZtf3bxIbDF5L0B2JeT5mv) and put the contents into `art/rgb/data/raw/validate`.
 
 **Create the folders if they don’t exist:**
 
 ```bash
 # Linux / macOS / Git Bash
-mkdir -p art/data/raw/train art/data/raw/validate
+mkdir -p art/rgb/data/raw/train art/rgb/data/raw/validate art/rgb/csv/raw art/rgb/report
 ```
 
 ```powershell
 # Windows PowerShell
-New-Item -ItemType Directory -Force -Path art/data/raw/train, art/data/raw/validate
+New-Item -ItemType Directory -Force -Path art/rgb/data/raw/train, art/rgb/data/raw/validate, art/rgb/csv/raw, art/rgb/report
 ```
 
 Then copy or extract the downloaded data into the correct folders.

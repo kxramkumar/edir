@@ -14,8 +14,10 @@ wheels/
 .ipynb_checkpoints/
 
 # Artifacts — ignore data contents but keep directory structure via .gitkeep
-art/data/raw/*
-!art/data/raw/.gitkeep
-art/data/clean/*
-!art/data/clean/.gitkeep
-
+art/rgb/data/raw/*
+!art/rgb/.gitkeep
+!art/rgb/data/raw/.gitkeep
+art/rgb/data/clean/*
+!art/rgb/data/clean/.gitkeep
+art/rgb/data/prep/*
+art/rgb/data/split/*
