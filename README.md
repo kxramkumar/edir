@@ -14,29 +14,30 @@ EDIR is an automated eye disease classification system that analyzes ocular imag
 
 | Folder | Description |
 |--------|-------------|
-| **art** | Artifacts: input and output. Data is organized by variant (**rgb** or **grey**). Each variant has its own `data`, `meta`, and `report` under `art/<variant>/` (e.g. `art/rgb/data/raw`, `art/grey/meta/raw`). See [Data layout (art/)](#data-layout-art) below. |
+| **res** | **Resource** root: all input data and run outputs. Shared raw data lives under `res/_common/`; per-run data (preprocess and augment) under `res/<RUN_TAG>/`. See [Data layout (res/)](#data-layout-res) below. |
 | **doc** | Project documentation (notes, reports, specs). |
 | **nbs** | Jupyter notebooks for exploration, preprocessing, and experiments. |
 | **ref** | Reference material (e.g. `brain_tumour.ipynb` as reference for this project). |
 | **src** | Reusable Python package and scripts; importable from notebooks and elsewhere after `uv sync`. |
 
-### Data layout (art/)
+### Data layout (res/)
 
-Data and outputs are split by variant so RGB and greyscale pipelines stay separate:
+- **res** = resource root (all data and outputs).
+- **prep** = preprocess: cleaned/resized images and step outputs.
+- **aug** = augment: copied + augmented images (train up to 2000/class; validate copied only).
+
+Shared raw input is under `res/_common/`. Each run is identified by **RUN_TAG** (e.g. `rgb_v1`); preprocess and augment outputs go under `res/<RUN_TAG>/`.
 
 | Path | Purpose |
 |------|---------|
-| `art/rgb/data/raw/train`, `art/rgb/data/raw/validate` | Raw RGB images (one subfolder per class). |
-| `art/rgb/data/clean/...` | Cleaned/processed RGB images. |
-| `art/rgb/meta/raw` | Manifest CSV for raw RGB (e.g. `image_manifest.csv`). |
-| `art/rgb/meta/clean` | Manifest CSV for cleaned RGB (optional). |
-| `art/rgb/report` | Reports and profiling for RGB (e.g. `report/profiling`). |
-| `art/grey/data/raw/...` | Raw greyscale images. |
-| `art/grey/data/clean/...` | Cleaned greyscale images. |
-| `art/grey/meta/raw`, `art/grey/meta/clean` | CSV manifests for grey variant. |
-| `art/grey/report` | Reports for grey variant. |
+| `res/_common/data/raw/train`, `res/_common/data/raw/validate` | Raw images (one subfolder per class). |
+| `res/<RUN_TAG>/data/prep/...` | Preprocess outputs (per-step train/validate). |
+| `res/<RUN_TAG>/data/aug/train`, `res/<RUN_TAG>/data/aug/validate` | Augment: train (copied + augmented), validate (copied only). |
+| `res/<RUN_TAG>/meta/raw` | Manifest CSV for raw (e.g. `image_manifest.csv`). |
+| `res/<RUN_TAG>/meta/prep` | Preprocess manifest. |
+| `res/<RUN_TAG>/meta/aug` | Augment manifest and lock (`image_augmented.lock`). |
 
-In the notebook (`nbs/eye_disease_v3_506.ipynb`), set `DATA_VARIANT = "rgb"` or `DATA_VARIANT = "grey"` in the Setup section to point at the desired variant.
+In the notebook Setup, set `RUN_TAG` (e.g. `"rgb_v1"`) and `RES_ROOT` (e.g. `os.path.join("..", "res")`). The notebook checks that `res/` and the raw folders exist and are non-empty before running.
 
 ## Setup
 
@@ -86,38 +87,53 @@ This installs everything in `pyproject.toml` (Jupyter, numpy, pandas, matplotlib
 
 **Adding a new dependency:** Jupyter only sees packages that are in the project. To use a new library in your notebooks, add it with `uv add <package-name>` (this updates `pyproject.toml`), then run `uv sync`. Restart the Jupyter kernel or restart Jupyter Lab so it picks up the new package.
 
-### 3. Set up the artifact directory and data
+### 3. Set up the resource directory and data
 
-The project expects input data under `art/<variant>/data/raw/`, where `<variant>` is **rgb** or **grey**. Each variant has its own `data`, `meta`, and `report` folders. Create the folders for the variant you use (e.g. `art/rgb/`) and add the dataset there.
+The project expects a **resource** root **res/** at the project root (or the path you set as `RES_ROOT` in the notebook). Shared raw data lives under `res/_common/data/raw/`; preprocess (**prep**) and augment (**aug**) outputs go under `res/<RUN_TAG>/`.
+
+**Understanding: paths and run tag**
+
+In the notebook Setup you set:
+
+- **RES_ROOT** — Resource root (e.g. `os.path.join("..", "res")`). Must exist.
+- **RUN_TAG** — Run identifier (e.g. `"rgb_v1"`). Prep and aug outputs go under `res/<RUN_TAG>/data/prep`, `res/<RUN_TAG>/data/aug`, and manifests under `res/<RUN_TAG>/meta/`.
+
+The notebook resolves paths like this:
+
+- Common raw: `res/_common/data/raw/train`, `res/_common/data/raw/validate` (one subfolder per class).
+- Preprocess: `res/<RUN_TAG>/data/prep/...`, manifest at `res/<RUN_TAG>/meta/prep/image_manifest.csv`.
+- Augment: `res/<RUN_TAG>/data/aug/train`, `res/<RUN_TAG>/data/aug/validate`, manifest at `res/<RUN_TAG>/meta/aug/image_manifest.csv`, lock at `res/<RUN_TAG>/meta/aug/image_augmented.lock`.
+
+It checks that `res/` exists and that the raw train/validate folders exist and contain at least one class subfolder before running.
 
 **Directory layout:**
 
 | Folder | Purpose |
 |--------|---------|
-| `art/rgb/data/raw/train` | Training images (one subfolder per class). |
-| `art/rgb/data/raw/validate` | Validation images (one subfolder per class). |
-| `art/rgb/data/clean` | Cleaned/processed images (populated later). |
-| `art/rgb/meta/raw` | Manifest CSV for raw data. |
-| `art/rgb/report` | Reports (e.g. profiling). Use `art/grey/...` for greyscale; set `DATA_VARIANT` in the notebook. |
+| `res/_common/data/raw/train` | Training images (one subfolder per class). |
+| `res/_common/data/raw/validate` | Validation images (one subfolder per class). |
+| `res/<RUN_TAG>/data/prep/...` | Preprocess outputs (populated by the notebook). |
+| `res/<RUN_TAG>/data/aug/...` | Augment outputs (populated by the notebook). |
+| `res/<RUN_TAG>/meta/raw`, `meta/prep`, `meta/aug` | Manifest CSVs and aug lock. |
 
 **Get the data (links shared by mentor):**
 
-1. **Train data** — [Download](https://drive.google.com/drive/folders/16uCYQS4-AiZrz4Jp6dXt9meM2QHh4JRv) and put the contents into `art/rgb/data/raw/train` (so that class folders e.g. `cataract`, `glaucoma`, `diabetic_retinopathy`, `normal` are directly inside `art/data/raw/train`).
-2. **Validate data** — [Download](https://drive.google.com/drive/folders/1FwfXqTUIVcTZtf3bxIbDF5L0B2JeT5mv) and put the contents into `art/rgb/data/raw/validate`.
+1. **Train data** — [Download](https://drive.google.com/drive/folders/16uCYQS4-AiZrz4Jp6dXt9meM2QHh4JRv) and put the contents into `res/_common/data/raw/train` (class folders e.g. `cataract`, `glaucoma`, `diabetic_retinopathy`, `normal` directly inside).
+2. **Validate data** — [Download](https://drive.google.com/drive/folders/1FwfXqTUIVcTZtf3bxIbDF5L0B2JeT5mv) and put the contents into `res/_common/data/raw/validate`.
 
 **Create the folders if they don’t exist:**
 
 ```bash
 # Linux / macOS / Git Bash
-mkdir -p art/rgb/data/raw/train art/rgb/data/raw/validate art/rgb/meta/raw art/rgb/report
+mkdir -p res/_common/data/raw/train res/_common/data/raw/validate
 ```
 
 ```powershell
 # Windows PowerShell
-New-Item -ItemType Directory -Force -Path art/rgb/data/raw/train, art/rgb/data/raw/validate, art/rgb/meta/raw, art/rgb/report
+New-Item -ItemType Directory -Force -Path res/_common/data/raw/train, res/_common/data/raw/validate
 ```
 
-Then copy or extract the downloaded data into the correct folders.
+Then copy or extract the downloaded data into the correct folders. The notebook creates `res/<RUN_TAG>/data/prep`, `res/<RUN_TAG>/data/aug`, and `res/<RUN_TAG>/meta/...` when you run it.
 
 ## Run Jupyter Lab
 

@@ -13,11 +13,12 @@ wheels/
 # Jupyter
 .ipynb_checkpoints/
 
-# Artifacts — ignore data contents but keep directory structure via .gitkeep
-art/rgb/data/raw/*
-!art/rgb/.gitkeep
-!art/rgb/data/raw/.gitkeep
-art/rgb/data/clean/*
-!art/rgb/data/clean/.gitkeep
-art/rgb/data/prep/*
-art/rgb/data/split/*
+# Resource — ignore data contents but keep directory structure via .gitkeep
+res/_common/data/raw/*
+!res/_common/.gitkeep
+!res/_common/data/raw/.gitkeep
+
+res/*/data/prep/*
+res/*/data/aug/*
+!res/*/data/prep/.gitkeep
+!res/*/data/aug/.gitkeep

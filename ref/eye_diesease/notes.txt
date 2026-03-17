@@ -1,0 +1,43 @@
+Steps performed in Data Preprocessing and Cleansing
+- problem statement
+- workflow explanation
+- dependencies
+- import statements
+- Dataset Directory Structure
+
+Exact duplicates
+1. need to get file path; for all 2 files
+2. remove 1 out of it
+
+Image size
+1. need to get file path; for all 195 files
+2. need to enhance using realesrgan* or Cv2 Interpolation
+
+Blur
+1. need to get file path; for all two bins (781 + 1424) files
+2. need to enhance using realesrgan* 
+
+Dark
+1. need to get file path; for all 91 files
+2. need to enhance using CLAHE (best for medical images)* or OpenCV
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    enhanced = clahe.apply(gray_image)
+
+
+Augmentation (Generate Augmented Image in Each Class >> (eye_disease_v3.ipynb)
+ # 1. Rotation: Keep it moderate to stay within the circular ROI
+    datagen = ImageDataGenerator(rotation_range=15, fill_mode='constant', cval=0)
+    show_image(datagen, "rotation_range=15")
+# 7. Zoom: [0.9, 1.1] is safer. 0.8 zooms in too much on the center.
+    datagen = ImageDataGenerator(zoom_range=0.1)
+    show_image(datagen, "zoom_range=0.1")
+# 9. Horizontal Flip: Essential (simulates the other eye).
+    datagen = ImageDataGenerator(horizontal_flip=True)
+    show_image(datagen, "horizontal_flip=True")
+
+Summary table
+Step	Preferred approach	Alternative	Reason
+Size	CV2 interpolation (LANCZOS4)	Real-ESRGAN	Size step only needs consistent dimensions; interpolation is fast and good enough.
+Blur	Unsharp mask / OpenCV	Real-ESRGAN	Fast and effective for 2k+ images; ESRGAN for small tests only.
+Dark	CLAHE (gray or per-channel)	Gamma / normalize	CLAHE is the standard for medical/dark regions; your formula is appropriate.
+So: use CV2 for size, OpenCV sharpening for blur, and CLAHE for dark as the main pipeline; treat Real-ESRGAN as optional for size/blur when you’re willing to pay the cost (time/GPU).

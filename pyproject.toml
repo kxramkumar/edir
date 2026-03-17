@@ -10,8 +10,8 @@ dependencies = [
     "imagehash>=4.3.2",
     "jupyter>=1.1.1",
     "matplotlib>=3.5,<=3.10",
-    "numpy>=1.22,<2.4",
-    "opencv-python>=4.13.0.92",
+    "numpy>=1.22",
+    "opencv-python>=4.8",
     "pandas==2.3.3",
     "pillow>=12.1.1",
     "plotly>=5.0.0",
@@ -19,5 +19,5 @@ dependencies = [
     "tqdm>=4.67.3",
     "cleanvision>=0.3.6",
     "split-folders>=0.5.1",
-    "tensorflow>2.13.0,<=2.21.0"
+    "tensorflow>=2.15",
 ]
