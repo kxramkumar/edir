@@ -34,10 +34,3 @@ Augmentation (Generate Augmented Image in Each Class >> (eye_disease_v3.ipynb)
 # 9. Horizontal Flip: Essential (simulates the other eye).
     datagen = ImageDataGenerator(horizontal_flip=True)
     show_image(datagen, "horizontal_flip=True")
-
-Summary table
-Step	Preferred approach	Alternative	Reason
-Size	CV2 interpolation (LANCZOS4)	Real-ESRGAN	Size step only needs consistent dimensions; interpolation is fast and good enough.
-Blur	Unsharp mask / OpenCV	Real-ESRGAN	Fast and effective for 2k+ images; ESRGAN for small tests only.
-Dark	CLAHE (gray or per-channel)	Gamma / normalize	CLAHE is the standard for medical/dark regions; your formula is appropriate.
-So: use CV2 for size, OpenCV sharpening for blur, and CLAHE for dark as the main pipeline; treat Real-ESRGAN as optional for size/blur when you’re willing to pay the cost (time/GPU).
