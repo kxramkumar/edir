@@ -22,3 +22,4 @@ res/*/data/prep/*
 res/*/data/aug/*
 !res/*/data/prep/.gitkeep
 !res/*/data/aug/.gitkeep
+res/*/data/model/*
