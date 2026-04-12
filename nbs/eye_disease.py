@@ -47,6 +47,7 @@ from PIL import Image
 from tqdm.notebook import tqdm
 from IPython.display import display, HTML
 from tensorflow.keras.preprocessing.image import ImageDataGenerator, img_to_array, load_img
+from sklearn.model_selection import train_test_split
 
 try:
     from cleanvision import Imagelab
@@ -95,7 +96,7 @@ def get_blur_bin(val):
 
 
 # ## 3. Paths — Resource root and run tag
-# Define **RES_ROOT** (`../res`), **RUN_TAG**; validate `res/_common/data/raw/train` and `res/_common/data/raw/validate` exist with class subfolders. Set **common_raw_dir**, **raw_train_dir**, **raw_val_dir**; **prep_dir**; **aug_train_dir**, **aug_val_dir**; **meta_raw_dir**, **meta_prep_dir**, **meta_aug_dir**. Manifest paths: **raw_manifest_path**, **prep_manifest_path**, **aug_manifest_path**; **aug_lock_path**; **rgb_hist_cache_path**, **gray_hist_cache_path**. Create all run-tag dirs. Display run summary (resource root, common raw, run data/meta).
+# Define **RES_ROOT** (`../res`), **RUN_TAG**; validate `res/_common/data/raw/train` and `res/_common/data/raw/validate` exist with class subfolders. Set **common_raw_dir**, **raw_train_dir**, **raw_val_dir**; **prep_dir**; **aug_train_dir**, **aug_val_dir**, **aug_test_dir**; **meta_raw_dir**, **meta_prep_dir**, **meta_aug_dir**. **Raw / prep manifest (before §7.6):** **split** is only **train** or **validate** (latter = raw `validate/` folder). **After §7.6:** **train** | **validate** (10% stratified from train) | **test** (renamed from former holdout **validate**). Paths: **raw_manifest_path**, **prep_manifest_path**, **aug_manifest_path**; **aug_copy_lock_path**, **aug_generate_lock_path**; **aug_lock_path** (`augment.lock`, augment section lock); **rgb_hist_cache_path**, **gray_hist_cache_path**. Create all run-tag dirs. Display run summary (resource root, common raw, run data/meta).
 # 
 # - `res/_common/data/raw/train/<class>/..`       — original train images, shared
 # - `res/_common/data/validate/<class>/..`  — original validate images, shared
@@ -138,10 +139,11 @@ for _dir, _label in [(raw_train_dir, "train"), (raw_val_dir, "validate")]:
 
 # Run-tag directories (data + meta)
 # Prep: `res/<run_tag>/data/prep/<step_dir>/train|<validate>/<class>/..`
-# Augment: `res/<run_tag>/data/aug/train|<validate>/<class>/..`
+# Augment: `res/<run_tag>/data/aug/train|validate|test/<class>/..` (manifest **validate** = dev; **test** = held-out)
 prep_dir        = os.path.join(RES_ROOT, RUN_TAG, "data", "prep")
-aug_train_dir = os.path.join(RES_ROOT, RUN_TAG, "data", "aug", "train")
-aug_val_dir   = os.path.join(RES_ROOT, RUN_TAG, "data", "aug", "validate")
+aug_train_dir   = os.path.join(RES_ROOT, RUN_TAG, "data", "aug", "train")
+aug_val_dir     = os.path.join(RES_ROOT, RUN_TAG, "data", "aug", "validate")
+aug_test_dir    = os.path.join(RES_ROOT, RUN_TAG, "data", "aug", "test")
 meta_raw_dir    = os.path.join(RES_ROOT, RUN_TAG, "meta", "raw")
 meta_prep_dir   = os.path.join(RES_ROOT, RUN_TAG, "meta", "prep")
 meta_aug_dir  = os.path.join(RES_ROOT, RUN_TAG, "meta", "aug")
@@ -150,12 +152,14 @@ meta_aug_dir  = os.path.join(RES_ROOT, RUN_TAG, "meta", "aug")
 raw_manifest_path    = os.path.join(meta_raw_dir,  "image_manifest.csv")
 prep_manifest_path  = os.path.join(meta_prep_dir, "image_manifest.csv")
 aug_manifest_path  = os.path.join(meta_aug_dir, "image_manifest.csv")
-aug_lock_path = os.path.join(meta_aug_dir, "image_augment.lock")
+aug_copy_lock_path     = os.path.join(meta_aug_dir, "aug_copy.lock")
+aug_generate_lock_path = os.path.join(meta_aug_dir, "aug_generate.lock")
+aug_lock_path          = os.path.join(meta_aug_dir, "augment.lock")
 rgb_hist_cache_path  = os.path.join(meta_raw_dir,  "rgb_hist_cache.pkl")
 gray_hist_cache_path = os.path.join(meta_raw_dir,  "gray_hist_cache.pkl")
 
 # Create meta and data dirs (no report folder)
-for _dir in [meta_raw_dir, meta_prep_dir, meta_aug_dir, prep_dir, aug_train_dir, aug_val_dir]:
+for _dir in [meta_raw_dir, meta_prep_dir, meta_aug_dir, prep_dir, aug_train_dir, aug_val_dir, aug_test_dir]:
     os.makedirs(_dir, exist_ok=True)
 
 rows = [
@@ -523,7 +527,7 @@ df_val_chart = pd.DataFrame({"class": classes, "total": [val_counts.get(c, 0) fo
 display(HTML("<strong>Train - Data Distribution</strong>"))
 display_wide(df_counts)
 show_attr_charts(df_train_chart, "class")
-# display(HTML("<strong>Validate - Data Distribution</strong>"))
+# display(HTML("<strong>Validate (raw holdout) - Data Distribution</strong>"))
 # show_attr_charts(df_val_chart, "class")
 
 
@@ -1454,7 +1458,7 @@ for col, src in [("has_odd_size", "is_odd_size_issue"), ("has_dark", "is_dark_is
 df_prep["has_blur"] = df_prep["blur"].apply(
     lambda v: get_blur_bin(v) in BLUR_CLEAN_BINS if pd.notna(v) else False
 )
-# Only train non-corrupt rows can have issues; validate/corrupt stay False
+# Only train non-corrupt rows can have issues; validate (raw holdout) / corrupt stay False
 df_prep.loc[~is_train_ok, ["has_odd_size", "has_dark", "has_blur", "has_exact_dup"]] = False
 
 def _build_issues(row):
@@ -1881,36 +1885,101 @@ if n_compare > 0:
 df_cm.to_csv(prep_manifest_path, index=False)
 print(f"Step 4 — clean: {done} enhanced (CLAHE + GaussianBlur), prep_path updated for {done} rows")
 
+# ### 7.6 Data split — Train / validate / test
+# Prep manifest in: **train** + **validate** (validate = raw `validate/` folder). Out: **train** (smaller) + **validate** (10% stratified from original train) + **test** (renamed from former **validate**). Skip if **test** already present.
+#
+
+# In[65]:
+
+
+df_cm = pd.read_csv(prep_manifest_path)
+if (df_cm["split"] == "test").any():
+    display(HTML("<strong>§7.6 skipped — manifest already has <code>split=test</code> (split step already done).</strong>"))
+else:
+    # Snapshot original training rows before any label changes
+    active_train = df_cm[df_cm["split"] == "train"].copy()
+    holdout_count = int((df_cm["split"] == "validate").sum())
+    # Step 1 — held-out folder: validate → test (final evaluation set)
+    df_cm.loc[df_cm["split"] == "validate", "split"] = "test"
+    # Step 2 — stratified train split: 90% train, 10% validate (model tuning)
+    train_idx, validate_idx = train_test_split(
+        active_train.index,
+        test_size=0.10,
+        stratify=active_train["class"],
+        random_state=42,
+    )
+    done_split = 0
+    for idx in tqdm(validate_idx, desc="Train → stratified validate", file=sys.stdout):
+        df_cm.at[idx, "split"] = "validate"
+        done_split += 1
+    display(HTML("<strong>Manifest split update — holdout → test; train → train + validate</strong>"))
+    stats_split = [
+        {"stage": "Original train (before stratify)", "count": len(active_train)},
+        {"stage": "New train (after stratify)", "count": len(train_idx)},
+        {"stage": "New validate (10% from train)", "count": done_split},
+        {"stage": "Test (was raw validate folder)", "count": holdout_count},
+    ]
+    display_wide(pd.DataFrame(stats_split))
+    val_check = df_cm[df_cm["split"] == "validate"]["class"].value_counts().to_frame().reset_index()
+    val_check.columns = ["class", "count in new validate"]
+    print("\nClass distribution in new validation set (10% stratified split):")
+    display(val_check)
+    df_cm.to_csv(prep_manifest_path, index=False)
+    print(f"\nSuccess: holdout relabeled validate→test ({holdout_count} rows); {done_split} train rows → validate.")
+
+# Class balance by split (prep manifest: train / validate / test)
+prep_classes_sorted = sorted(df_cm["class"].dropna().unique())
+for split_key, split_title in [("train", "Train"), ("validate", "Validate"), ("test", "Test")]:
+    sub = df_cm[df_cm["split"] == split_key]
+    counts = sub["class"].value_counts()
+    df_prep_split_chart = pd.DataFrame(
+        {"class": prep_classes_sorted, "total": [int(counts.get(c, 0)) for c in prep_classes_sorted]}
+    )
+    display(HTML(f"<strong>§7.6 — Prep manifest: {split_title} (class distribution)</strong>"))
+    show_attr_charts(df_prep_split_chart, "class")
 
 # ## 8. Augmentation
-# Two sub-steps: (1) Copy **prep manifest** and prep images to **aug** dirs; update **aug_path** in **aug manifest**; (2) Generate augmented **train** images up to **2000 per class** (rotation, zoom, horizontal_flip), **RGB** only; write **lock file**. Output: `res/<RUN_TAG>/data/aug/train/`, `res/<RUN_TAG>/data/aug/validate/` (per `<class>/`); `meta/aug/image_manifest.csv`, `meta/aug/image_augmented.lock`.
+# Two sub-steps, two locks: **aug_copy.lock**, **aug_generate.lock**. **augment.lock** (**aug_lock_path**) = augment section lock (both sub-steps treated complete). Output: `data/aug/train|validate|test/`; `meta/aug/image_manifest.csv`.
 
 # ### 8.1 Copy files — Copy process files
-# If aug lock file exists: show “Already augmented” and report counts from aug manifest. Else: copy prep_manifest_path to aug_manifest_path; add aug_path column. For train (prep_status != "removed"): source = prep_path or path; copy file to aug_train_dir/<class>/<basename>; set aug_path to RUN_TAG/data/aug/train/<class>/<basename>. For validate: same to aug_val_dir. Save aug manifest. Display copy summary (train/validate copied, path) and per-class counts.
+# If **aug_copy.lock** or **aug_lock_path**: report from aug manifest only. Else: copy prep → aug, write **aug_copy.lock**.
 
 # In[19]:
 
 
-if os.path.isfile(aug_lock_path):
-    display(HTML("<strong>Already augmented.</strong> Remove the lock file to run again.<br><code>" + os.path.abspath(aug_lock_path) + "</code>"))
-    # Get counts from aug manifest CSV for report
-    train_copied = val_copied = 0
+if os.path.isfile(aug_copy_lock_path) or os.path.isfile(aug_lock_path):
+    aug_copy_skip_html = (
+        "<strong>Augment copy already done.</strong> To re-run, delete:<br><code>"
+        + os.path.abspath(aug_copy_lock_path)
+        + "</code>"
+    )
+    if os.path.isfile(aug_lock_path) and not os.path.isfile(aug_copy_lock_path):
+        aug_copy_skip_html += (
+            "<br>Augment section lock (<code>augment.lock</code> — full augment section marked complete; copy skipped):<br><code>"
+            + os.path.abspath(aug_lock_path)
+            + "</code>"
+        )
+    display(HTML(aug_copy_skip_html))
+    train_copied = val_copied = test_copied = 0
     train_class_counts = {}
     val_class_counts = {}
+    test_class_counts = {}
     if os.path.isfile(aug_manifest_path):
         df_aug = pd.read_csv(aug_manifest_path)
         df_aug["aug_path"] = df_aug["aug_path"].astype(object).fillna("")
-        train_with_aug = df_aug[(df_aug["split"] == "train") & (df_aug["aug_path"].str.strip() != "")]
-        val_with_aug = df_aug[(df_aug["split"] == "validate") & (df_aug["aug_path"].str.strip() != "")]
-        train_copied = len(train_with_aug)
-        val_copied = len(val_with_aug)
-        train_class_counts = train_with_aug["class"].value_counts().to_dict() if not train_with_aug.empty else {}
-        val_class_counts = val_with_aug["class"].value_counts().to_dict() if not val_with_aug.empty else {}
-    classes_aug = sorted(set(train_class_counts) | set(val_class_counts))
+
+        def _aug_lock_stats(split_key):
+            sub = df_aug[(df_aug["split"] == split_key) & (df_aug["aug_path"].str.strip() != "")]
+            return len(sub), (sub["class"].value_counts().to_dict() if not sub.empty else {})
+
+        train_copied, train_class_counts = _aug_lock_stats("train")
+        val_copied, val_class_counts = _aug_lock_stats("validate")
+        test_copied, test_class_counts = _aug_lock_stats("test")
+    classes_aug = sorted(set(train_class_counts) | set(val_class_counts) | set(test_class_counts))
 else:
     # copy prep manifest to aug
     shutil.copy2(prep_manifest_path, aug_manifest_path)
-    print(f"Aug Step 1 — copied prep manifest → {aug_manifest_path}")
+    print(f"Augment step 1 — copied prep manifest → {aug_manifest_path}")
 
     # Load aug manifest (paths come from here for copy step)
     df_aug = pd.read_csv(aug_manifest_path)
@@ -1930,76 +1999,92 @@ else:
             return None
         return os.path.join(RES_ROOT, rel.replace("/", os.sep))
 
-    # Copy train files (split == "train", prep_status != "removed")
-    train_rows = df_aug[(df_aug["split"] == "train") & (df_aug["prep_status"] != "removed")]
-    train_copied = 0
-    train_class_counts = {}
-    for idx, row in tqdm(train_rows.iterrows(), total=len(train_rows), desc="Aug copy train", file=sys.stdout):
-        src = _aug_source_path(row)
-        if src is None or not os.path.isfile(src):
-            continue
-        cls = row["class"]
-        basename = os.path.basename(src)
-        dest_dir = os.path.join(aug_train_dir, cls)
-        os.makedirs(dest_dir, exist_ok=True)
-        dest = os.path.join(dest_dir, basename)
-        shutil.copy2(src, dest)
-        rel_aug = f"{RUN_TAG}/data/aug/train/{cls}/{basename}".replace("\\", "/")
-        df_aug.at[idx, "aug_path"] = rel_aug
-        train_copied += 1
-        train_class_counts[cls] = train_class_counts.get(cls, 0) + 1
-    print(f"Aug copy — train: {train_copied} files → {aug_train_dir}")
+    def _aug_dest_rel(dest_abs):
+        """Manifest aug_path relative to RES_ROOT — matches aug_train_dir / aug_val_dir / aug_test_dir layout."""
+        return os.path.relpath(dest_abs, RES_ROOT).replace("\\", "/")
 
-    # Copy validate files (split == "validate")
-    val_rows = df_aug[df_aug["split"] == "validate"]
-    val_copied = 0
-    val_class_counts = {}
-    for idx, row in tqdm(val_rows.iterrows(), total=len(val_rows), desc="Aug copy validate", file=sys.stdout):
-        src = _aug_source_path(row)
-        if src is None or not os.path.isfile(src):
-            continue
-        cls = row["class"]
-        basename = os.path.basename(src)
-        dest_dir = os.path.join(aug_val_dir, cls)
-        os.makedirs(dest_dir, exist_ok=True)
-        dest = os.path.join(dest_dir, basename)
-        shutil.copy2(src, dest)
-        rel_aug = f"{RUN_TAG}/data/aug/validate/{cls}/{basename}".replace("\\", "/")
-        df_aug.at[idx, "aug_path"] = rel_aug
-        val_copied += 1
-        val_class_counts[cls] = val_class_counts.get(cls, 0) + 1
-    print(f"Aug copy — validate: {val_copied} files → {aug_val_dir}")
+    def _copy_manifest_rows_to_aug(rows_df, aug_root, tqdm_desc):
+        n = 0
+        counts = {}
+        for idx, row in tqdm(rows_df.iterrows(), total=len(rows_df), desc=tqdm_desc, file=sys.stdout):
+            src = _aug_source_path(row)
+            if src is None or not os.path.isfile(src):
+                continue
+            cls = row["class"]
+            dest_dir = os.path.join(aug_root, cls)
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, os.path.basename(src))
+            shutil.copy2(src, dest)
+            df_aug.at[idx, "aug_path"] = _aug_dest_rel(dest)
+            n += 1
+            counts[cls] = counts.get(cls, 0) + 1
+        return n, counts
+
+    _aug_copy_jobs = [
+        ((df_aug["split"] == "train") & (df_aug["prep_status"] != "removed"), aug_train_dir, "Augment copy train", "train"),
+        (df_aug["split"] == "validate", aug_val_dir, "Augment copy validate", "validate"),
+        (df_aug["split"] == "test", aug_test_dir, "Augment copy test", "test"),
+    ]
+    _aug_label_print = {"train": "train", "validate": "validate (dev)", "test": "test"}
+    split_copied_and_counts = {}
+    for mask, aug_dir, desc, label in _aug_copy_jobs:
+        n, cts = _copy_manifest_rows_to_aug(df_aug[mask], aug_dir, desc)
+        split_copied_and_counts[label] = (n, cts)
+        print(f"Augment copy — {_aug_label_print[label]}: {n} files → {aug_dir}")
+    train_copied, train_class_counts = split_copied_and_counts["train"]
+    val_copied, val_class_counts = split_copied_and_counts["validate"]
+    test_copied, test_class_counts = split_copied_and_counts["test"]
 
     # Write aug manifest back with aug_path column updated
     df_aug.to_csv(aug_manifest_path, index=False)
-    print(f"Aug manifest updated with aug_path → {aug_manifest_path}")
+    print(f"Augment manifest updated with aug_path → {aug_manifest_path}")
+    with open(aug_copy_lock_path, "w") as _f:
+        _f.write("")
+    print(f"Augment copy lock: {os.path.abspath(aug_copy_lock_path)}")
 
-    classes_aug = sorted(set(train_class_counts) | set(val_class_counts))
+    classes_aug = sorted(set(train_class_counts) | set(val_class_counts) | set(test_class_counts))
 
 # Single report block (from copy run or from manifest when lock present)
 display(HTML("<strong>Augment copy — summary</strong>"))
 df_aug_summary = pd.DataFrame([
     {"split": "train", "copied": train_copied, "path": aug_train_dir},
     {"split": "validate", "copied": val_copied, "path": aug_val_dir},
+    {"split": "test", "copied": test_copied, "path": aug_test_dir},
 ])
 display_wide(df_aug_summary)
 if classes_aug:
     display(HTML("<strong>Augment copy — per class</strong>"))
     df_aug_per_class = pd.DataFrame([
-        {"class": c, "train": train_class_counts.get(c, 0), "validate": val_class_counts.get(c, 0)}
+        {
+            "class": c,
+            "train": train_class_counts.get(c, 0),
+            "validate": val_class_counts.get(c, 0),
+            "test": test_class_counts.get(c, 0),
+        }
         for c in classes_aug
     ])
     display_wide(df_aug_per_class)
 
 
 # ### 8.2 Augment images — Train only, 2000 per class
-# If **lock** exists: skip. Else: **TARGET_COUNT**=2000, **IMG_SIZE**=(512,512). Build **train_sources_by_class** from **aug_train_dir** (shuffled file list per class). Three **Keras ImageDataGenerator**s: **rotation_range**=15; **zoom_range**=0.1; **horizontal_flip**=True. For each class: **needed** = 2000 - current_count; for each needed: pick random source, **load_img** RGB **target_size**=IMG_SIZE, apply one of the three transforms (rotation/zoom/flip), save as PNG (`stem_augNNN.png`) in same class dir. Create **aug lock file**. Then display aug class counts (train/validate) and **show_attr_charts** for aug train and validate.
+# If **aug_generate.lock** or **aug_lock_path**: skip. Else: generate train images, write **aug_generate.lock** (independent of aug copy lock).
 
 # In[9]:
 
 
-if os.path.isfile(aug_lock_path):
-    display(HTML("<strong>Already augmented.</strong> Remove the lock file to run augment again.<br><code>" + os.path.abspath(aug_lock_path) + "</code>"))
+if os.path.isfile(aug_generate_lock_path) or os.path.isfile(aug_lock_path):
+    aug_generate_skip_html = (
+        "<strong>Augment generate already done.</strong> To re-run, delete:<br><code>"
+        + os.path.abspath(aug_generate_lock_path)
+        + "</code>"
+    )
+    if os.path.isfile(aug_lock_path) and not os.path.isfile(aug_generate_lock_path):
+        aug_generate_skip_html += (
+            "<br>Augment section lock (<code>augment.lock</code> — full augment section marked complete):<br><code>"
+            + os.path.abspath(aug_lock_path)
+            + "</code>"
+        )
+    display(HTML(aug_generate_skip_html))
 else:
     TARGET_COUNT = 2000
     IMG_SIZE = (512, 512)
@@ -2051,7 +2136,7 @@ else:
         if needed <= 0:
             continue
 
-        for i in tqdm(range(needed), desc=f"Aug {cls}", leave=False, file=sys.stdout):
+        for i in tqdm(range(needed), desc=f"Augment {cls}", leave=False, file=sys.stdout):
             src = np.random.choice(source_paths)
             stem = os.path.splitext(os.path.basename(src))[0]
             count_str = f"{i + 1:03d}"
@@ -2067,14 +2152,13 @@ else:
                 x = np.clip(x, 0, 255).astype(np.uint8)
             Image.fromarray(x).save(out_path, format="PNG")
 
-    display(HTML("<strong>Aug — augmentation done. Train split only; 2000 per class.</strong>"))
+    display(HTML("<strong>Augmentation done.</strong> Train split only; 2000 per class target."))
 
-    # Create lock file so this section is not run again unless user removes it
-    with open(aug_lock_path, "w") as _f:
+    with open(aug_generate_lock_path, "w") as _f:
         _f.write("")
-    print(f"Lock file created: {os.path.abspath(aug_lock_path)}")
+    print(f"Augment generate lock: {os.path.abspath(aug_generate_lock_path)}")
 
-# Aug — Class labels & counts (same style as raw "Class labels & counts" section)
+# Augment — Class labels & counts (same style as raw "Class labels & counts" section)
 def _count_files_in_dir(d):
     if not os.path.isdir(d):
         return 0
@@ -2082,6 +2166,7 @@ def _count_files_in_dir(d):
 
 aug_train_counts = {}
 aug_val_counts = {}
+aug_test_counts = {}
 for name in (os.listdir(aug_train_dir) if os.path.isdir(aug_train_dir) else []):
     p = os.path.join(aug_train_dir, name)
     if os.path.isdir(p) and not name.startswith("."):
@@ -2090,21 +2175,695 @@ for name in (os.listdir(aug_val_dir) if os.path.isdir(aug_val_dir) else []):
     p = os.path.join(aug_val_dir, name)
     if os.path.isdir(p) and not name.startswith("."):
         aug_val_counts[name] = _count_files_in_dir(p)
-classes_aug_report = sorted(set(aug_train_counts) | set(aug_val_counts))
+for name in (os.listdir(aug_test_dir) if os.path.isdir(aug_test_dir) else []):
+    p = os.path.join(aug_test_dir, name)
+    if os.path.isdir(p) and not name.startswith("."):
+        aug_test_counts[name] = _count_files_in_dir(p)
+classes_aug_report = sorted(set(aug_train_counts) | set(aug_val_counts) | set(aug_test_counts))
 
 df_aug_counts = pd.DataFrame([
     {"data": "aug", "split": "train", **{c: aug_train_counts.get(c, 0) for c in classes_aug_report}, "total": sum(aug_train_counts.values())},
     {"data": "aug", "split": "validate", **{c: aug_val_counts.get(c, 0) for c in classes_aug_report}, "total": sum(aug_val_counts.values())},
+    {"data": "aug", "split": "test", **{c: aug_test_counts.get(c, 0) for c in classes_aug_report}, "total": sum(aug_test_counts.values())},
 ])
 df_aug_counts = df_aug_counts[["data", "split"] + list(classes_aug_report) + ["total"]]
 
 df_aug_train_chart = pd.DataFrame({"class": classes_aug_report, "total": [aug_train_counts.get(c, 0) for c in classes_aug_report]})
 df_aug_val_chart = pd.DataFrame({"class": classes_aug_report, "total": [aug_val_counts.get(c, 0) for c in classes_aug_report]})
+df_aug_test_chart = pd.DataFrame({"class": classes_aug_report, "total": [aug_test_counts.get(c, 0) for c in classes_aug_report]})
 
 display(HTML("<strong>Augment — Class labels & counts</strong>"))
 display_wide(df_aug_counts)
 display(HTML("<strong>Augment — Train (class distribution)</strong>"))
 show_attr_charts(df_aug_train_chart, "class")
-display(HTML("<strong>Augment — Validate (class distribution)</strong>"))
+display(HTML("<strong>Augment — Validate / dev (class distribution)</strong>"))
 show_attr_charts(df_aug_val_chart, "class")
+display(HTML("<strong>Augment — Test / held-out (class distribution)</strong>"))
+show_attr_charts(df_aug_test_chart, "class")
+
+
+# ## 9. Modeling
+# Classifiers are trained from a **frozen copy** of the aug tree under  
+# **`res/<RUN_TAG>/data/model/<model_name>/train|validate|test/<class>/..`** so **aug/** is never modified.
+# Final **`state_dict`** for each model is saved under that same **`data/model/<model_name>/`** as **`<model_name>.pth`**; if that file exists, the model’s **training** cell skips fitting and only loads for evaluation.
+#
+# - **§9.1 Common methods:** path layout, copy **aug → model**, generic train/validate loop, eval helper — no input modality (RGB vs medical) assumptions.
+# - **§9.2** **`effnet_b4_rgb`**: **RGB** — unchanged aug images copied into **`data/model/effnet_b4_rgb/`**, ImageNet-style resize/normalize, EfficientNet-B4 (v5 aug-track).
+# - **§9.3** **`effnet_b4_g`**: **green-channel** pipeline — **`medical_step_b4`** (v5 med-track) writes pseudo-RGB PNGs into **`data/model/effnet_b4_g/`**; loaders use **ToTensor + normalize** only (380×380 on disk).
+
+# ### 9.1 Common methods
+# Code cell used by all §9 models. **Does not** write under **aug/**; reads **aug** and writes only under **`data/model/<model_name>/`**.
+#
+# **Imports:** **PyTorch** core (`nn`, `optim`, **`DataLoader`**); **sklearn** classification report + confusion matrix for **`display_classification_eval_charts`**. Per-model cells add **torchvision** / **`ssl`** as needed.
+#
+# **Path helper:** **`model_image_roots(model_name)`** — returns dict with **`root`**, **`train`**, **`validate`**, **`test`** paths under `res/<RUN_TAG>/data/model/<model_name>/`.
+#
+# **Copy from aug:** **`copy_split_class_tree_to_model`** copies one aug split root (class subfolders + images per **IMAGE_EXTENSIONS**) into the matching model split folder. **`copy_all_aug_splits_to_model`** runs train / validate / test from **`aug_train_dir`**, **`aug_val_dir`**, **`aug_test_dir`**; writes **`from_aug_copy.lock`** in the model **`root`** when done. **`skip_if_lock=True`** skips recopy when the lock exists (delete lock to refresh after aug changes).
+#
+# **Training:** **`train_model_validate_best`** — each epoch runs **`train`** then **`validate`**; records loss/acc history; when **validate** accuracy improves, saves **`state_dict`** to **`best_weights_path`**.
+#
+# **Evaluation:** **`evaluate_on_split`** — runs model on a loader, returns **`y_true`**, **`y_pred`**. **`display_classification_eval_charts`** — sklearn **`classification_report`** as **`display_wide`** HTML table (same look as augment / prep summaries); then **`show_attr_charts`** for bar + sunburst + confusion heatmap.
+
+# In[90]:
+
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from sklearn.metrics import classification_report, confusion_matrix
+
+
+# Resolve **root/train/validate/test** paths under `res/<RUN_TAG>/data/model/<model_name>/`.
+def model_image_roots(model_name):
+    """
+    Per-model directory layout under the run tag (image files only; checkpoints sit alongside).
+    """
+    root = os.path.join(RES_ROOT, RUN_TAG, "data", "model", model_name)
+    return {
+        "root": root,
+        "train": os.path.join(root, "train"),
+        "validate": os.path.join(root, "validate"),
+        "test": os.path.join(root, "test"),
+    }
+
+
+# Bitwise copy of allowed image extensions from one aug split tree into a model split folder.
+def copy_split_class_tree_to_model(aug_split_dir, model_split_dir, tqdm_label):
+    """
+    Copy `<class>/*` image files from one aug split root into the model split root.
+    Uses **IMAGE_EXTENSIONS**; does not alter **aug_split_dir**.
+    """
+    if not os.path.isdir(aug_split_dir):
+        print(f"copy_split_class_tree_to_model: missing source {aug_split_dir}")
+        return 0
+    total = 0
+    for klass in sorted(x for x in os.listdir(aug_split_dir) if not x.startswith(".")):
+        kp = os.path.join(aug_split_dir, klass)
+        if not os.path.isdir(kp):
+            continue
+        out_k = os.path.join(model_split_dir, klass)
+        os.makedirs(out_k, exist_ok=True)
+        files = [
+            f
+            for f in os.listdir(kp)
+            if not f.startswith(".") and f.lower().endswith(IMAGE_EXTENSIONS)
+        ]
+        for fn in tqdm(files, desc=f"{tqdm_label} {klass}", file=sys.stdout, leave=False):
+            shutil.copy2(os.path.join(kp, fn), os.path.join(out_k, fn))
+            total += 1
+    return total
+
+
+# Copy all aug splits into **model_name** layout; **from_aug_copy.lock** can skip repeat work.
+def copy_all_aug_splits_to_model(model_name, skip_if_lock=False):
+    """
+    Copy **aug** train / validate / test class folders into  
+    **`data/model/<model_name>/train|validate|test`**.
+
+    Optional **from_aug_copy.lock** in the model folder skips repeat copies (delete lock to refresh).
+    """
+    layout = model_image_roots(model_name)
+    os.makedirs(layout["root"], exist_ok=True)
+    lock_path = os.path.join(layout["root"], "from_aug_copy.lock")
+
+    if skip_if_lock and os.path.isfile(lock_path):
+        display(
+            HTML(
+                "<strong>Model data copy skipped (lock).</strong> Delete to recopy from aug:<br><code>"
+                + os.path.abspath(lock_path)
+                + "</code>"
+            )
+        )
+        return None
+
+    n_train = copy_split_class_tree_to_model(aug_train_dir, layout["train"], "Model copy train")
+    n_val = copy_split_class_tree_to_model(aug_val_dir, layout["validate"], "Model copy validate")
+    n_test = copy_split_class_tree_to_model(aug_test_dir, layout["test"], "Model copy test")
+
+    with open(lock_path, "w") as _lk:
+        _lk.write("")
+    summary = pd.DataFrame(
+        [
+            {"split": "train", "copied": n_train, "path": layout["train"]},
+            {"split": "validate", "copied": n_val, "path": layout["validate"]},
+            {"split": "test", "copied": n_test, "path": layout["test"]},
+        ]
+    )
+    display(HTML("<strong>Copied aug → model folder</strong>"))
+    display_wide(summary)
+    print(f"Model copy lock: {os.path.abspath(lock_path)}")
+    return layout
+
+
+# Epoch loop over **phases** (train + validate); persist best validate acc to **best_weights_path**.
+def train_model_validate_best(
+    model,
+    criterion,
+    optimizer,
+    dataloaders,
+    dataset_sizes,
+    device,
+    num_epochs,
+    best_weights_path,
+    phases=("train", "validate"),
+):
+    """
+    Alternates **train** and **validate** each epoch; saves **state_dict** when validate accuracy improves.
+    """
+    best_acc = 0.0
+    history = {f"{p}_loss": [] for p in phases}
+    history.update({f"{p}_acc": [] for p in phases})
+
+    for epoch in range(num_epochs):
+        print(f"Epoch {epoch + 1}/{num_epochs}")
+        for phase in phases:
+            model.train() if phase == "train" else model.eval()
+            running_loss = 0.0
+            running_corrects = 0
+
+            for inputs, labels in tqdm(dataloaders[phase], leave=False, file=sys.stdout):
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+                optimizer.zero_grad()
+                with torch.set_grad_enabled(phase == "train"):
+                    outputs = model(inputs)
+                    _, preds = torch.max(outputs, 1)
+                    loss = criterion(outputs, labels)
+                    if phase == "train":
+                        loss.backward()
+                        optimizer.step()
+                running_loss += loss.item() * inputs.size(0)
+                running_corrects += torch.sum(preds == labels.data)
+
+            epoch_loss = running_loss / dataset_sizes[phase]
+            epoch_acc = running_corrects.double() / dataset_sizes[phase]
+            history[f"{phase}_loss"].append(epoch_loss)
+            history[f"{phase}_acc"].append(epoch_acc.item())
+            print(f"  {phase} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}")
+
+            if phase == "validate" and epoch_acc > best_acc:
+                best_acc = epoch_acc
+                torch.save(model.state_dict(), best_weights_path)
+                print(f"  → saved best weights ({best_acc:.4f}) → {best_weights_path}")
+
+    return model, history
+
+
+# Run **model** on one **DataLoader**; collect label indices for sklearn / reporting.
+def evaluate_on_split(model, dataloader, device, title="evaluation"):
+    """Return **y_true**, **y_pred** numpy lists for sklearn metrics."""
+    model.eval()
+    y_true, y_pred = [], []
+    with torch.no_grad():
+        for inputs, labels in tqdm(dataloader, desc=title, file=sys.stdout):
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            outputs = model(inputs)
+            _, preds = torch.max(outputs, 1)
+            y_true.extend(labels.cpu().numpy())
+            y_pred.extend(preds.cpu().numpy())
+    return y_true, y_pred
+
+
+# Held-out test: HTML metric table via **display_wide** + **show_attr_charts** confusion/balance.
+def display_classification_eval_charts(y_true, y_pred, class_names, model_label):
+    """
+    **Held-out test** evaluation: **`display_wide`** table built from sklearn **classification_report**
+    (same styling as other notebook summaries), then **`show_attr_charts`** (bar + sunburst + confusion heatmap).
+    """
+    cn = list(class_names)
+    rep = classification_report(
+        y_true, y_pred, target_names=cn, output_dict=True, zero_division=0
+    )
+    rows = []
+    for name in cn:
+        r = rep[name]
+        rows.append(
+            {
+                "Class": name,
+                "Precision": round(float(r["precision"]), 4),
+                "Recall": round(float(r["recall"]), 4),
+                "F1-score": round(float(r["f1-score"]), 4),
+                "Support": int(r["support"]),
+            }
+        )
+    n_sup = sum(int(rep[c]["support"]) for c in cn)
+    rows.append(
+        {
+            "Class": "accuracy",
+            "Precision": "",
+            "Recall": "",
+            "F1-score": round(float(rep["accuracy"]), 4),
+            "Support": n_sup,
+        }
+    )
+    for agg in ("macro avg", "weighted avg"):
+        r = rep[agg]
+        rows.append(
+            {
+                "Class": agg,
+                "Precision": round(float(r["precision"]), 4),
+                "Recall": round(float(r["recall"]), 4),
+                "F1-score": round(float(r["f1-score"]), 4),
+                "Support": int(r["support"]),
+            }
+        )
+    df_rep = pd.DataFrame(rows)
+    display(HTML(f"<strong>Test set (held-out) classification report — {model_label}</strong>"))
+    display_wide(df_rep)
+
+    labels_ord = list(range(len(cn)))
+    cm = confusion_matrix(y_true, y_pred, labels=labels_ord)
+    df_cm = pd.DataFrame(cm, columns=cn)
+    df_cm.insert(0, "class", cn)
+    df_cm["total"] = df_cm[cn].sum(axis=1).astype(int)
+    display(
+        HTML(f"<strong>{model_label} — held-out test: class balance + confusion counts</strong>")
+    )
+    show_attr_charts(df_cm, "class")
+
+
+# ### 9.2 Model **`effnet_b4_rgb`** — EfficientNet-B4 on RGB aug copy
+# Copies **`aug/train|validate|test/<class>/`** (read-only source) into **`data/model/effnet_b4_rgb/...`** via §9.1 **`copy_all_aug_splits_to_model`**. **`from_aug_copy.lock`** in that model root skips recopy when **`skip_if_lock=True`** (delete lock to refresh after aug changes).
+#
+# **Loaders:** **torchvision** **Resize** to B4 input size, **ToTensor**, ImageNet **mean/std** normalize; **`ImageFolder`** + **`DataLoader`** on the on-disk copy.
+#
+# **`ssl`** workaround may apply when downloading ImageNet backbone weights over HTTPS.
+#
+# **Checkpoint:** **`effnet_b4_rgb.pth`** in the model directory; if present, **training is skipped** (same pattern as §9.3). Test report + confusion charts: §9.1 **`display_classification_eval_charts`**.
+#
+# Uses §9.1: **`copy_all_aug_splits_to_model`**, **`train_model_validate_best`**, **`evaluate_on_split`**, **`display_classification_eval_charts`**.
+
+# In[91]:
+
+
+import ssl
+
+from torch.utils.data import DataLoader
+from torchvision.datasets import ImageFolder
+from torchvision import models
+import torchvision.transforms as transforms
+
+
+# --- Identity & training hyperparameters (RGB / aug-copy track) ---
+MODEL_NAME_EFFNET_B4_RGB = "effnet_b4_rgb"
+EFFNET_B4_IMG_SIZE = 380
+EFFNET_B4_BATCH = 16
+EFFNET_B4_EPOCHS = 15
+EFFNET_B4_LR = 0.001
+EFFNET_B4_NUM_WORKERS = 0  # 0: safe default for Jupyter on Windows
+
+
+# **ImageFolder** + loaders for RGB on-disk trees: resize, tensor, ImageNet normalize.
+def make_rgb_imagenet_loaders(
+    layout,
+    img_size=380,
+    batch_size=16,
+    num_workers=0,
+):
+    """
+    **RGB / ImageNet-pretrained** pipeline: train / validate / test **ImageFolder** + **DataLoader**.
+    **num_workers=0** avoids common multiprocessing issues in Jupyter on Windows.
+    """
+    tfm = transforms.Compose(
+        [
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+    image_datasets = {
+        "train": ImageFolder(root=layout["train"], transform=tfm),
+        "validate": ImageFolder(root=layout["validate"], transform=tfm),
+        "test": ImageFolder(root=layout["test"], transform=tfm),
+    }
+    dataloaders = {
+        k: DataLoader(
+            image_datasets[k],
+            batch_size=batch_size,
+            shuffle=(k == "train"),
+            num_workers=num_workers,
+        )
+        for k in image_datasets
+    }
+    dataset_sizes = {k: len(image_datasets[k]) for k in image_datasets}
+    class_names = image_datasets["train"].classes
+    return dataloaders, dataset_sizes, class_names
+
+
+# Pretrained weight download over HTTPS (optional SSL workaround; same idea as §9.3)
+ssl._create_default_https_context = ssl._create_unverified_context
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"device={device}; model={MODEL_NAME_EFFNET_B4_RGB}")
+
+# Build `data/model/effnet_b4_rgb/{train,validate,test}/...` from aug (read-only source)
+layout_effnet_rgb = copy_all_aug_splits_to_model(
+    MODEL_NAME_EFFNET_B4_RGB,
+    skip_if_lock=True,
+)
+if layout_effnet_rgb is None:
+    # Lock told us to skip recopy; paths still come from **model_image_roots**
+    layout_effnet_rgb = model_image_roots(MODEL_NAME_EFFNET_B4_RGB)
+
+# Best checkpoint path: same basename as **MODEL_NAME_EFFNET_B4_RGB** (.pth)
+effnet_b4_rgb_weights_path = os.path.join(
+    layout_effnet_rgb["root"], f"{MODEL_NAME_EFFNET_B4_RGB}.pth"
+)
+skip_effnet_rgb_training = os.path.isfile(effnet_b4_rgb_weights_path)
+
+dataloaders_effnet, sizes_effnet, class_names_effnet = make_rgb_imagenet_loaders(
+    layout_effnet_rgb,
+    img_size=EFFNET_B4_IMG_SIZE,
+    batch_size=EFFNET_B4_BATCH,
+    num_workers=EFFNET_B4_NUM_WORKERS,
+)
+num_classes_effnet = len(class_names_effnet)
+print(
+    f"model={MODEL_NAME_EFFNET_B4_RGB}; classes={num_classes_effnet} {class_names_effnet}; splits={sizes_effnet}"
+)
+
+# EfficientNet-B4: ImageNet backbone only when training (skip download if loading .pth only)
+weights_b4_rgb = models.EfficientNet_B4_Weights.IMAGENET1K_V1
+model_effnet_b4_rgb = models.efficientnet_b4(
+    weights=None if skip_effnet_rgb_training else weights_b4_rgb,
+)
+for param in model_effnet_b4_rgb.parameters():
+    param.requires_grad = False
+num_ftrs_rgb = model_effnet_b4_rgb.classifier[1].in_features
+model_effnet_b4_rgb.classifier[1] = nn.Linear(num_ftrs_rgb, num_classes_effnet)
+model_effnet_b4_rgb = model_effnet_b4_rgb.to(device)
+
+test_eval_title_rgb = f"Test eval — {MODEL_NAME_EFFNET_B4_RGB}"
+
+# Train only when weights file missing; otherwise UI message and go straight to load + test
+if skip_effnet_rgb_training:
+    display(
+        HTML(
+            "<strong>Training skipped.</strong> Remove weights to retrain:<br><code>"
+            + os.path.abspath(effnet_b4_rgb_weights_path)
+            + "</code>"
+        )
+    )
+else:
+    criterion_effnet = nn.CrossEntropyLoss()
+    optimizer_effnet = optim.Adam(
+        model_effnet_b4_rgb.classifier[1].parameters(), lr=EFFNET_B4_LR
+    )
+    model_effnet_b4_rgb, history_effnet = train_model_validate_best(
+        model_effnet_b4_rgb,
+        criterion_effnet,
+        optimizer_effnet,
+        dataloaders_effnet,
+        sizes_effnet,
+        device,
+        EFFNET_B4_EPOCHS,
+        effnet_b4_rgb_weights_path,
+        phases=("train", "validate"),
+    )
+    display(
+        HTML(
+            "<strong>Training finished.</strong> Weights:<br><code>"
+            + os.path.abspath(effnet_b4_rgb_weights_path)
+            + "</code>"
+        )
+    )
+
+# Reload best **state_dict** (last epoch in memory may differ)
+model_effnet_b4_rgb.load_state_dict(
+    torch.load(effnet_b4_rgb_weights_path, map_location=device)
+)
+# Held-out **test** split only here (validate was used during training for model selection)
+y_true_t, y_pred_t = evaluate_on_split(
+    model_effnet_b4_rgb,
+    dataloaders_effnet["test"],
+    device,
+    title=test_eval_title_rgb,
+)
+# **`display_wide`** classification_report table + balance/confusion **show_attr_charts**
+display_classification_eval_charts(
+    y_true_t, y_pred_t, class_names_effnet, MODEL_NAME_EFFNET_B4_RGB
+)
+
+
+# ### 9.3 Model **`effnet_b4_g`** — EfficientNet-B4 on green-channel (CLAHE) preprocessing
+# Reads **aug/** (never modified). For each split, applies **`medical_step_b4`** from `eye_disease_v5.py`: green channel → CLAHE → blur → ROI crop → 380×380 → **pseudo-RGB** (3 identical planes), saves **PNG** under **`data/model/effnet_b4_g/train|validate|test/<class>/`**.
+#
+# **`from_aug_green_processed.lock`** in that model root skips reprocessing when **`skip_if_lock=True`** (delete lock — and optionally the split folders — to rebuild after aug changes).
+#
+# **Loaders:** no **Resize** in **transforms** (images are already 380×380); **ToTensor** + ImageNet **normalize** (same as v5 med dataloaders).
+#
+# **Checkpoint:** **`effnet_b4_g.pth`** in the model directory; if present, **training is skipped** (same pattern as §9.2). **ssl** workaround applies when downloading ImageNet backbone weights. Test report + confusion matrix: §9.1 **`display_classification_eval_charts`**.
+
+# In[92]:
+
+
+import ssl
+
+from torch.utils.data import DataLoader
+from torchvision.datasets import ImageFolder
+from torchvision import models
+import torchvision.transforms as transforms
+
+# --- Identity & training hyperparameters (green / pseudo-RGB track) ---
+MODEL_NAME_EFFNET_B4_G = "effnet_b4_g"
+EFFNET_B4_G_IMG_SIZE = 380
+EFFNET_B4_G_BATCH = 16
+EFFNET_B4_G_EPOCHS = 15
+EFFNET_B4_G_LR = 0.001
+EFFNET_B4_G_NUM_WORKERS = 0  # 0: safe default for Jupyter on Windows
+
+
+# Load one image path → 380×380×3 pseudo-RGB (green/CLAHE/ROI) BGR array, or None if read fails.
+def medical_step_b4(image_path, target_size=(380, 380)):
+    """Green-channel fundus-style prep for B4 (ref: eye_disease_v5.py)."""
+    img = cv2.imread(image_path)
+    if img is None:
+        return None
+
+    green = img[:, :, 1]  # vessel contrast vs full RGB
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(green)
+
+    blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
+
+    _, mask = cv2.threshold(blurred, 10, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        cnt = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(cnt)
+        blurred = blurred[y : y + h, x : x + w]
+
+    resized = cv2.resize(blurred, target_size)
+    # Stack grayscale plane ×3 so EfficientNet sees 3-channel input
+    return cv2.merge([resized, resized, resized])
+
+
+# Process every image under one aug split (e.g. train) into **model_split_dir** class folders as PNGs.
+def process_aug_split_to_effnet_b4_g(
+    aug_split_dir,
+    model_split_dir,
+    tqdm_label,
+    target_size=(380, 380),
+):
+    """Walk aug split class folders; write green-processed PNGs into **model_split_dir**."""
+    # One aug split (train / validate / test) → mirror class subdirs under model folder
+    if not os.path.isdir(aug_split_dir):
+        print(f"process_aug_split_to_effnet_b4_g: missing source {aug_split_dir}")
+        return 0
+    total = 0
+    for klass in sorted(x for x in os.listdir(aug_split_dir) if not x.startswith(".")):
+        kp = os.path.join(aug_split_dir, klass)
+        if not os.path.isdir(kp):
+            continue
+        out_k = os.path.join(model_split_dir, klass)
+        os.makedirs(out_k, exist_ok=True)
+        files = [
+            f
+            for f in os.listdir(kp)
+            if not f.startswith(".") and f.lower().endswith(IMAGE_EXTENSIONS)
+        ]
+        for fn in tqdm(files, desc=f"{tqdm_label} {klass}", file=sys.stdout, leave=False):
+            input_path = os.path.join(kp, fn)
+            processed = medical_step_b4(input_path, target_size=target_size)
+            if processed is not None:
+                # Normalize extension: always PNG after CLAHE pipeline
+                out_name = os.path.splitext(fn)[0] + ".png"
+                cv2.imwrite(os.path.join(out_k, out_name), processed)
+                total += 1
+    return total
+
+
+# Run green pipeline for train + validate + test aug trees into **data/model/<model_name>/** (optional lock).
+def process_all_aug_splits_to_effnet_b4_g(model_name, skip_if_lock=False, target_size=(380, 380)):
+    """Populate **data/model/<model_name>/** from aug via **`medical_step_b4`**."""
+    layout = model_image_roots(model_name)
+    os.makedirs(layout["root"], exist_ok=True)
+    # Skip full reprocessing if user already ran this (delete lock to refresh after aug edits)
+    lock_path = os.path.join(layout["root"], "from_aug_green_processed.lock")
+
+    if skip_if_lock and os.path.isfile(lock_path):
+        display(
+            HTML(
+                "<strong>Green preprocess skipped (lock).</strong> Delete to rebuild from aug:<br><code>"
+                + os.path.abspath(lock_path)
+                + "</code>"
+            )
+        )
+        return None
+
+    n_train = process_aug_split_to_effnet_b4_g(
+        aug_train_dir, layout["train"], "Green train", target_size
+    )
+    n_val = process_aug_split_to_effnet_b4_g(
+        aug_val_dir, layout["validate"], "Green validate", target_size
+    )
+    n_test = process_aug_split_to_effnet_b4_g(
+        aug_test_dir, layout["test"], "Green test", target_size
+    )
+
+    with open(lock_path, "w") as _lk:
+        _lk.write("")
+    summary = pd.DataFrame(
+        [
+            {"split": "train", "processed": n_train, "path": layout["train"]},
+            {"split": "validate", "processed": n_val, "path": layout["validate"]},
+            {"split": "test", "processed": n_test, "path": layout["test"]},
+        ]
+    )
+    display(HTML(f"<strong>Processed aug → {model_name}</strong>"))
+    display_wide(summary)
+    print(f"Green preprocess lock: {os.path.abspath(lock_path)}")
+    return layout
+
+
+# Build **DataLoader**s over **layout** PNGs: tensorize + ImageNet normalize (no resize).
+def make_green_effnet_loaders(
+    layout,
+    batch_size=16,
+    num_workers=0,
+):
+    """Already 380×380 on disk — only tensor + ImageNet normalize (v5 med-track)."""
+    # No Resize: **medical_step_b4** fixed output size; normalize matches ImageNet-pretrained B4
+    tfm = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+    image_datasets = {
+        "train": ImageFolder(root=layout["train"], transform=tfm),
+        "validate": ImageFolder(root=layout["validate"], transform=tfm),
+        "test": ImageFolder(root=layout["test"], transform=tfm),
+    }
+    dataloaders = {
+        k: DataLoader(
+            image_datasets[k],
+            batch_size=batch_size,
+            shuffle=(k == "train"),
+            num_workers=num_workers,
+        )
+        for k in image_datasets
+    }
+    dataset_sizes = {k: len(image_datasets[k]) for k in image_datasets}
+    class_names = image_datasets["train"].classes
+    return dataloaders, dataset_sizes, class_names
+
+
+# Pretrained weight download over HTTPS (optional SSL workaround; same idea as RGB model cell)
+ssl._create_default_https_context = ssl._create_unverified_context
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"device={device}; model={MODEL_NAME_EFFNET_B4_G}")
+
+# Build `data/model/effnet_b4_g/{train,validate,test}/...` from aug (read-only source)
+layout_effnet_g = process_all_aug_splits_to_effnet_b4_g(
+    MODEL_NAME_EFFNET_B4_G,
+    skip_if_lock=True,
+    target_size=(EFFNET_B4_G_IMG_SIZE, EFFNET_B4_G_IMG_SIZE),
+)
+if layout_effnet_g is None:
+    # Lock told us to skip disk copy; paths still come from **model_image_roots**
+    layout_effnet_g = model_image_roots(MODEL_NAME_EFFNET_B4_G)
+
+# Best checkpoint path: same basename as **MODEL_NAME_EFFNET_B4_G** (.pth)
+effnet_b4_g_weights_path = os.path.join(
+    layout_effnet_g["root"], f"{MODEL_NAME_EFFNET_B4_G}.pth"
+)
+skip_effnet_g_training = os.path.isfile(effnet_b4_g_weights_path)
+
+dataloaders_g, sizes_g, class_names_g = make_green_effnet_loaders(
+    layout_effnet_g,
+    batch_size=EFFNET_B4_G_BATCH,
+    num_workers=EFFNET_B4_G_NUM_WORKERS,
+)
+num_classes_g = len(class_names_g)
+print(
+    f"model={MODEL_NAME_EFFNET_B4_G}; classes={num_classes_g} {class_names_g}; splits={sizes_g}"
+)
+
+# EfficientNet-B4: ImageNet backbone only when training (skip download if loading .pth only)
+weights_b4_g = models.EfficientNet_B4_Weights.IMAGENET1K_V1
+model_effnet_b4_g = models.efficientnet_b4(
+    weights=None if skip_effnet_g_training else weights_b4_g,
+)
+for param in model_effnet_b4_g.parameters():
+    param.requires_grad = False
+num_ftrs_g = model_effnet_b4_g.classifier[1].in_features
+model_effnet_b4_g.classifier[1] = nn.Linear(num_ftrs_g, num_classes_g)
+model_effnet_b4_g = model_effnet_b4_g.to(device)
+
+test_eval_title_g = f"Test eval — {MODEL_NAME_EFFNET_B4_G}"
+
+# Train only when weights file missing; otherwise UI message and go straight to load + test
+if skip_effnet_g_training:
+    display(
+        HTML(
+            "<strong>Training skipped.</strong> Remove weights to retrain:<br><code>"
+            + os.path.abspath(effnet_b4_g_weights_path)
+            + "</code>"
+        )
+    )
+else:
+    # Head-only Adam: frozen trunk, same pattern as **effnet_b4_rgb**
+    criterion_g = nn.CrossEntropyLoss()
+    optimizer_g = optim.Adam(
+        model_effnet_b4_g.classifier[1].parameters(), lr=EFFNET_B4_G_LR
+    )
+    model_effnet_b4_g, _ = train_model_validate_best(
+        model_effnet_b4_g,
+        criterion_g,
+        optimizer_g,
+        dataloaders_g,
+        sizes_g,
+        device,
+        EFFNET_B4_G_EPOCHS,
+        effnet_b4_g_weights_path,
+        phases=("train", "validate"),
+    )
+    display(
+        HTML(
+            "<strong>Training finished.</strong> Weights:<br><code>"
+            + os.path.abspath(effnet_b4_g_weights_path)
+            + "</code>"
+        )
+    )
+
+# Reload best **state_dict** (last epoch in memory may differ)
+model_effnet_b4_g.load_state_dict(
+    torch.load(effnet_b4_g_weights_path, map_location=device)
+)
+# Held-out **test** split only here (validate was used during training for model selection)
+y_true_g, y_pred_g = evaluate_on_split(
+    model_effnet_b4_g,
+    dataloaders_g["test"],
+    device,
+    title=test_eval_title_g,
+)
+# **display_classification_eval_charts**: **`display_wide`** **classification_report** table + balance/confusion **show_attr_charts**
+display_classification_eval_charts(
+    y_true_g, y_pred_g, class_names_g, MODEL_NAME_EFFNET_B4_G
+)
 

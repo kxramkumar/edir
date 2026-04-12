@@ -11,7 +11,7 @@ Weights: set **``weights``** in **MODEL_LIST** (absolute path, or relative to th
 2. **mode/<name>/<name>.pth**
 3. **res/<RUN_TAG>/data/model/<name>/<name>.pth**
 
-Layout: **Setup** (path) → **Result by CLASS** → **Summary** (tabs: each model, **ALL**, **PREVIEW** when multi-model). **PREVIEW** shows side-by-side images and predictions for rows selected in **Result by CLASS**. One **file** × all models per rerun until complete. Session cache until path set changes.
+Layout: **Setup** (path) → **Result by CLASS** (whole-batch inference progress) → **Summary** only after every file has all models scored (Streamlit **fragment**). **Summary** ALL / per-model tabs reuse a session cache for that batch; **PREVIEW** always follows live row selection. One **file** × all models per step until complete. Session cache until path set changes.
 
 Run from repo root::
 
@@ -35,6 +35,15 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import streamlit as st
+
+try:
+    _st_fragment = st.fragment  # Streamlit >= 1.37: partial reruns for widgets inside the fragment
+except AttributeError:
+
+    def _st_fragment(f):
+        return f
+
+
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
@@ -72,6 +81,23 @@ PATH_FEEDBACK_STATE_KEY = "_path_feedback_norm"
 SUMMARY_TAB_PREVIEW = "Preview"
 SUMMARY_TAB_PICK_KEY = "summary_tab_pick"
 COMPARE_PATHS_SIG_KEY = "_compare_paths_sig"
+CLASS_TAB_PICK_KEY = "result_class_tab_pick"
+# Last **Result by CLASS** segment; switching clears that table’s selection and **Preview** paths for a clean reload.
+LAST_RESULT_CLASS_KEY = "_last_result_class_tab"
+# Single **st.empty()** for all **Summary** content below the segmented control (ALL / PREVIEW / per-model).
+# Switches tabs by replacing one subtree so PREVIEW does not stack with confusion-matrix content.
+SUMMARY_BODY_PLACEHOLDER_KEY = "_edir_summary_body_ph"
+# Snapshot for **@st.fragment** reruns (main() does not re-execute on in-fragment widget events).
+FRAG_INVENTORY_KEY = "_edir_frag_inventory"
+FRAG_NAMES_KEY = "_edir_frag_names"
+FRAG_MK_KEY = "_edir_frag_mk_slug"
+FRAG_FILES_KEY = "_edir_frag_files"
+FRAG_WEIGHTS_KEY = "_edir_frag_weights"
+# **Summary** static tabs (ALL + per-model): cached while batch + preds unchanged; **PREVIEW** never uses this.
+SUMMARY_STATIC_CACHE_KEY = "_edir_summary_static_fp"
+SUMMARY_SUMM_DF_KEY = "_edir_summary_summ_df"
+SUMMARY_PC_DF_KEY = "_edir_summary_pc_df"
+SUMMARY_CM_STORE_KEY = "_edir_summary_cm_store"
 
 IMAGENET_NORMALIZE = transforms.Normalize(
     mean=[0.485, 0.456, 0.406],
@@ -129,6 +155,24 @@ def _summary_segmented_pick(
     return default
 
 
+def _ensure_segmented_control_default(key: str, valid_display: list[str]) -> None:
+    """If **st.session_state**[key] is missing or not in **valid_display**, set it to the first option (default tab)."""
+    if not valid_display:
+        return
+    valid = set(valid_display)
+    default = valid_display[0]
+    raw = st.session_state.get(key)
+    if raw is None:
+        st.session_state[key] = default
+        return
+    if isinstance(raw, (list, tuple)):
+        if len(raw) == 0 or str(raw[0]) not in valid:
+            st.session_state[key] = default
+        return
+    if str(raw) not in valid:
+        st.session_state[key] = default
+
+
 def infer_class_from_path(raw_name: str) -> str | None:
     path = Path(raw_name)
     class_set = set(CLASS_NAMES)
@@ -181,6 +225,26 @@ section.main > div {
 }
 div[data-baseweb="select"] > div {
     border-radius: 10px !important;
+}
+/* Tabs (Result by CLASS, etc.): left-aligned strip, not stretched to full main width */
+div[data-testid="stTabs"] {
+    width: fit-content !important;
+    max-width: 100% !important;
+}
+div[data-testid="stTabs"] [data-baseweb="tab-list"],
+div[data-testid="stTabs"] [role="tablist"] {
+    width: fit-content !important;
+    justify-content: flex-start !important;
+}
+/* Summary panel switcher (segmented_control key summary_tab_pick): compact, left */
+div.st-key-summary_tab_pick {
+    width: fit-content !important;
+    max-width: 100% !important;
+}
+/* Result by CLASS switcher (segmented_control key result_class_tab_pick): same as Summary */
+div.st-key-result_class_tab_pick {
+    width: fit-content !important;
+    max-width: 100% !important;
 }
 </style>
 """,
@@ -317,6 +381,42 @@ def next_file_needing_predictions(
         if any(fp not in deploy_preds.get(n, {}) for n in model_names):
             return p
     return None
+
+
+def inference_files_completed(
+    files: list[Path],
+    model_names: list[str],
+    deploy_preds: dict[str, dict[str, dict[str, object]]],
+) -> tuple[int, int]:
+    """Files that have an entry for **every** model (``done`` or ``error``). Returns ``(completed, total)``."""
+    n = len(files)
+    if n == 0:
+        return 0, 0
+    c = 0
+    for p in files:
+        fp = str(p.resolve())
+        if all(fp in deploy_preds.get(m, {}) for m in model_names):
+            c += 1
+    return c, n
+
+
+def _summary_static_fingerprint(
+    mk_slug: str,
+    files: list[Path],
+    model_names: list[str],
+    deploy_preds: dict[str, dict[str, dict[str, object]]],
+) -> str:
+    """Stable hash for **Summary** tables that only depend on batch + predictions (not row selection)."""
+    lines: list[str] = [mk_slug]
+    for p in sorted(files, key=lambda x: str(x).lower()):
+        fp = str(p.resolve())
+        lines.append(fp)
+        for m in model_names:
+            pr = deploy_preds.get(m, {}).get(fp, {})
+            stt = str(pr.get("inference_status", ""))
+            pred = str(pr.get("predicted_class", ""))
+            lines.append(f"{m}:{stt}:{pred}")
+    return hashlib.sha256("\n".join(lines).encode("utf-8", errors="replace")).hexdigest()
 
 
 def run_deploy_predictions_for_one_file(
@@ -637,15 +737,13 @@ def render_compare_blocks(
     img_width: int = COMPARE_ROW_IMG_WIDTH,
 ) -> None:
     """One horizontal row per (file, model): path, **actual**, model, softmax **probabilities**, images."""
-    compare_hint = st.empty()
     if not paths:
-        compare_hint.info(
-            "**Nothing selected.** In **Result by CLASS**, select one or more rows in the table (multi-select), "
-            "then open the **PREVIEW** tab under **Summary** to see each chosen image with **original** and **preprocessed** views "
-            "and every model’s **probabilities**, with the same text colors as the table."
+        st.info(
+            "**Nothing selected.** In **Result by CLASS**, open the class you want, multi-select rows in **that** table only, "
+            "then open **PREVIEW** under **Summary** (images, preproc, per-model **probabilities** — same colors as the table). "
+            "Switching class clears that table’s selection and starts fresh for **Preview**."
         )
         return
-    compare_hint.empty()
     inv_map: dict[str, dict[str, object]] = {
         str(r["full_path"]): dict(r) for _, r in inventory.iterrows()
     }
@@ -743,30 +841,61 @@ def pivot_display_columns(pivot: pd.DataFrame, model_names: list[str]) -> list[s
     return cols
 
 
-def compare_full_paths_from_dataframe_event(pivot: pd.DataFrame, event) -> list[str]:
+def _event_row_indices(event: object) -> tuple[int, ...]:
+    """Stable row-index tuple from **st.dataframe** ``on_select`` event (for change detection)."""
+    if event is None:
+        return ()
+    sel = getattr(event, "selection", None)
+    if sel is None:
+        return ()
+    rows = getattr(sel, "rows", None)
+    if not rows:
+        return ()
+    try:
+        return tuple(sorted(int(x) for x in list(rows)))
+    except (TypeError, ValueError):
+        return ()
+
+
+def _dataframe_row_indices(widget_key: str, event: object) -> tuple[int, ...]:
+    """Row selection: prefer **st.session_state** (authoritative) then event object."""
+    raw = st.session_state.get(widget_key)
+    if isinstance(raw, dict):
+        sel = raw.get("selection")
+        if isinstance(sel, dict):
+            rows = sel.get("rows")
+            if rows is not None:
+                try:
+                    return tuple(sorted(int(x) for x in list(rows)))
+                except (TypeError, ValueError):
+                    pass
+    return _event_row_indices(event)
+
+
+def compare_full_paths_from_dataframe_event(
+    pivot: pd.DataFrame, event: object, *, widget_key: str
+) -> list[str]:
     """**full_path** values for the current **st.dataframe** selection (one class tab)."""
-    sel = event.selection
-    sel_rows = list(sel.rows) if sel is not None and sel.rows else []
-    if not sel_rows or pivot.empty:
+    sel_rows = list(_dataframe_row_indices(widget_key, event))
+    return paths_from_stored_row_indices(pivot, tuple(sel_rows))
+
+
+def paths_from_stored_row_indices(pivot: pd.DataFrame, indices: tuple[int, ...]) -> list[str]:
+    """Map row indices to **full_path** (shared helper for dataframe selection)."""
+    if pivot.empty or not indices:
         return []
     out: list[str] = []
-    for ri in sorted(sel_rows, key=int):
-        ii = int(ri)
+    for ii in indices:
         if 0 <= ii < len(pivot):
             out.append(str(Path(pivot.iloc[ii]["full_path"])))
     return out
 
 
-def merge_compare_paths_unique(groups: list[list[str]]) -> list[str]:
-    """Stable de-dupe: first occurrence wins (order across class tabs left-to-right)."""
-    seen: set[str] = set()
-    out: list[str] = []
-    for g in groups:
-        for fp in g:
-            if fp not in seen:
-                seen.add(fp)
-                out.append(fp)
-    return out
+def _summary_body_placeholder():
+    """Stable slot for **Summary** panel body (everything below the segment switcher)."""
+    if SUMMARY_BODY_PLACEHOLDER_KEY not in st.session_state:
+        st.session_state[SUMMARY_BODY_PLACEHOLDER_KEY] = st.empty()
+    return st.session_state[SUMMARY_BODY_PLACEHOLDER_KEY]
 
 
 def style_results_pivot(
@@ -796,6 +925,225 @@ def style_results_pivot(
 
         styler = styler.apply(make_col_styler(m), axis=0, subset=[m])
     return styler
+
+
+def _results_summary_fragment_impl() -> None:
+    """**Result by CLASS**, **Summary**, and one inference step. Reruns independently of **Setup** (``st.fragment``)."""
+    inventory = st.session_state.get(FRAG_INVENTORY_KEY)
+    if not isinstance(inventory, pd.DataFrame) or inventory.empty:
+        return
+
+    names_raw = st.session_state.get(FRAG_NAMES_KEY)
+    if not isinstance(names_raw, list) or not names_raw:
+        return
+    names = [str(x) for x in names_raw]
+
+    mk_slug = str(st.session_state.get(FRAG_MK_KEY, ""))
+    files_raw = st.session_state.get(FRAG_FILES_KEY)
+    if not isinstance(files_raw, list):
+        return
+    files = [Path(str(p)) for p in files_raw]
+
+    weights_raw = st.session_state.get(FRAG_WEIGHTS_KEY)
+    if not isinstance(weights_raw, dict):
+        return
+    weights_by_name: dict[str, Path] = {str(k): Path(str(v)) for k, v in weights_raw.items()}
+
+    dp = st.session_state.deploy_preds
+    inference_complete = next_file_needing_predictions(files, names, dp) is None
+
+    present_classes = {assigned_label_class(dict(r)) for _, r in inventory.iterrows()}
+    class_tab_order = [c for c in CLASS_NAMES if c in present_classes]
+    if "unlabeled" in present_classes:
+        class_tab_order.append("unlabeled")
+
+    st.subheader("Result by CLASS")
+    done_batch, n_batch = inference_files_completed(files, names, dp)
+    if n_batch > 0:
+        st.progress(
+            min(done_batch / n_batch, 1.0),
+            text=f"Inference (all models, whole batch): {done_batch} / {n_batch} files",
+        )
+        if not inference_complete:
+            st.caption("**Summary** (metrics, PREVIEW, ALL) appears after every file has been run for every model.")
+
+    if not class_tab_order:
+        st.caption("No files to classify.")
+        st.session_state.compare_paths = []
+    else:
+        class_tab_display = [c.upper() for c in class_tab_order]
+        display_to_class = dict(zip(class_tab_display, class_tab_order))
+
+        _ensure_segmented_control_default(CLASS_TAB_PICK_KEY, class_tab_display)
+        ctab = st.segmented_control(
+            " ",
+            options=class_tab_display,
+            selection_mode="single",
+            label_visibility="collapsed",
+            key=CLASS_TAB_PICK_KEY,
+            width="content",
+        )
+        picked_class_d = _summary_segmented_pick(
+            ctab,
+            st.session_state.get(CLASS_TAB_PICK_KEY),
+            class_tab_display,
+        )
+        picked_cls = display_to_class[picked_class_d]
+
+        prev_cls = st.session_state.get(LAST_RESULT_CLASS_KEY)
+        key_df = f"df_class_{picked_cls}_{mk_slug}"
+        if prev_cls is not None and prev_cls != picked_cls:
+            st.session_state.pop(key_df, None)
+            st.session_state.compare_paths = []
+            st.session_state.pop(COMPARE_PATHS_SIG_KEY, None)
+        st.session_state[LAST_RESULT_CLASS_KEY] = picked_cls
+
+        pivot = pivot_for_files(inventory, dp, names, class_filter=picked_cls)
+        if pivot.empty:
+            st.caption("No files in this class.")
+            st.session_state.compare_paths = []
+        else:
+            st.caption(
+                f"**{picked_cls}** — {len(pivot)} file(s). "
+                "**CA** cataract · **DR** diabetic_retinopathy · **GL** glaucoma · **NR** normal. "
+                "**Preview** uses only rows selected in **this** class (switching class clears selection)."
+            )
+            styled = style_results_pivot(pivot, names, dp)
+            ev = st.dataframe(
+                styled,
+                width="stretch",
+                height=DATAFRAME_VIEW_HEIGHT,
+                on_select="rerun",
+                selection_mode="multi-row",
+                key=key_df,
+            )
+            st.session_state.compare_paths = compare_full_paths_from_dataframe_event(
+                pivot, ev, widget_key=key_df
+            )
+
+    if inference_complete:
+        st.subheader("Summary")
+        _sum_fp = _summary_static_fingerprint(mk_slug, files, names, dp)
+        if st.session_state.get(SUMMARY_STATIC_CACHE_KEY) != _sum_fp:
+            st.session_state[SUMMARY_STATIC_CACHE_KEY] = _sum_fp
+            st.session_state[SUMMARY_SUMM_DF_KEY] = model_summary_table(
+                names, files, inventory, dp
+            )
+            st.session_state[SUMMARY_PC_DF_KEY] = per_class_recall_by_model_dataframe(
+                names, files, inventory, dp
+            )
+            st.session_state[SUMMARY_CM_STORE_KEY] = {}
+        summ_df = st.session_state[SUMMARY_SUMM_DF_KEY]
+        pc_df_cached = st.session_state[SUMMARY_PC_DF_KEY]
+        cm_store: dict[str, np.ndarray] = st.session_state[SUMMARY_CM_STORE_KEY]
+
+        sum_labels = list(names)
+        if len(names) > 1:
+            sum_labels.append("all")
+        sum_labels.append(SUMMARY_TAB_PREVIEW)
+        sum_tab_display = [x.upper() for x in sum_labels]
+        display_to_label = dict(zip(sum_tab_display, sum_labels))
+
+        paths_now = list(st.session_state.get("compare_paths") or [])
+        sig_now = tuple(sorted(paths_now))
+        sig_prev = st.session_state.get(COMPARE_PATHS_SIG_KEY)
+        if sig_prev != sig_now:
+            st.session_state[COMPARE_PATHS_SIG_KEY] = sig_now
+            if sig_prev is not None:
+                st.session_state[SUMMARY_TAB_PICK_KEY] = SUMMARY_TAB_PREVIEW.upper()
+
+        _ensure_segmented_control_default(SUMMARY_TAB_PICK_KEY, sum_tab_display)
+        sel = st.segmented_control(
+            " ",
+            options=sum_tab_display,
+            selection_mode="single",
+            label_visibility="collapsed",
+            key=SUMMARY_TAB_PICK_KEY,
+            width="content",
+        )
+        picked = _summary_segmented_pick(
+            sel,
+            st.session_state.get(SUMMARY_TAB_PICK_KEY),
+            sum_tab_display,
+        )
+        label = display_to_label[picked]
+
+        body_ph = _summary_body_placeholder()
+        body_ph.empty()
+        with body_ph.container():
+            if label == "all":
+                st.caption(
+                    "Cross-model summary table and **per-class recall**; confusion heatmaps are on each model tab."
+                )
+                st.dataframe(summ_df, width="stretch", hide_index=True)
+                st.markdown("##### Per-class accuracy by model (recall, %)")
+                st.dataframe(pc_df_cached, width="stretch", hide_index=True)
+                st.caption(
+                    "Each model column: **%** recall per **actual** (row total in that model’s confusion matrix, "
+                    "finished valid predictions). **n_actual** = images with that **actual** in the batch."
+                )
+            elif label == SUMMARY_TAB_PREVIEW:
+                render_compare_blocks(
+                    list(st.session_state.get("compare_paths") or []),
+                    inventory,
+                    dp,
+                    names,
+                )
+            else:
+                row = summ_df[summ_df["model"] == label]
+                if row.empty:
+                    st.caption("No data.")
+                else:
+                    r = row.iloc[0]
+                    if label not in cm_store:
+                        cm_store[label] = confusion_matrix_labeled(
+                            files, inventory, dp.get(label, {})
+                        )
+                    mat = cm_store[label]
+                    hm_col, stats_col = st.columns([0.36, 0.64], gap="small")
+                    with hm_col:
+                        render_confusion_heatmap(
+                            mat,
+                            f"{label}\nactual × predicted",
+                            size="mini",
+                        )
+                    with stats_col:
+                        if int(r["total"]) > 0:
+                            done = int(r["inference_ok"]) + int(r["inference_err"])
+                            st.progress(
+                                min(done / int(r["total"]), 1.0),
+                                text=f"Inference: {done} / {int(r['total'])} files",
+                            )
+                        st.caption(
+                            "**Correct** and **Accuracy**: vs **actual**. "
+                            f"Runs: {int(r['inference_ok'])} ok, {int(r['inference_err'])} errors."
+                        )
+                        a, b, c = st.columns(3)
+                        with a:
+                            st.metric("Total files", int(r["total"]))
+                        with b:
+                            st.metric("Pending", int(r["pending"]))
+                        with c:
+                            st.metric("Labeled", int(r["labeled"]))
+                        d, e = st.columns(2)
+                        with d:
+                            st.metric("Correct", int(r["correct"]))
+                        acc = r["accuracy"]
+                        with e:
+                            if pd.isna(acc):
+                                st.metric("Accuracy", "—")
+                            else:
+                                st.metric("Accuracy", f"{float(acc) * 100:.1f}%")
+
+    p_run = next_file_needing_predictions(files, names, st.session_state.deploy_preds)
+    if p_run is not None:
+        run_deploy_predictions_for_one_file(
+            p_run, names, weights_by_name, st.session_state.deploy_preds
+        )
+        st.rerun()
+
+
+_results_summary_fragment = _st_fragment(_results_summary_fragment_impl)
 
 
 def main() -> None:
@@ -948,143 +1296,39 @@ def main() -> None:
         st.session_state.compare_paths = []
         st.session_state.pop(COMPARE_PATHS_SIG_KEY, None)
         st.session_state.pop(SUMMARY_TAB_PICK_KEY, None)
+        st.session_state.pop(CLASS_TAB_PICK_KEY, None)
+        st.session_state.pop(LAST_RESULT_CLASS_KEY, None)
+        _sum_ph_reset = st.session_state.pop(SUMMARY_BODY_PLACEHOLDER_KEY, None)
+        if _sum_ph_reset is not None:
+            _sum_ph_reset.empty()
+        for _fk in (
+            FRAG_INVENTORY_KEY,
+            FRAG_NAMES_KEY,
+            FRAG_MK_KEY,
+            FRAG_FILES_KEY,
+            FRAG_WEIGHTS_KEY,
+        ):
+            st.session_state.pop(_fk, None)
+        for _sk in (
+            SUMMARY_STATIC_CACHE_KEY,
+            SUMMARY_SUMM_DF_KEY,
+            SUMMARY_PC_DF_KEY,
+            SUMMARY_CM_STORE_KEY,
+        ):
+            st.session_state.pop(_sk, None)
 
     inventory = build_file_inventory_dataframe(folder, files)
     if inventory.empty:
         st.info("No rows.")
         return
 
-    dp = st.session_state.deploy_preds
+    st.session_state[FRAG_INVENTORY_KEY] = inventory
+    st.session_state[FRAG_NAMES_KEY] = list(names)
+    st.session_state[FRAG_MK_KEY] = mk_slug
+    st.session_state[FRAG_FILES_KEY] = [str(p.resolve()) for p in files]
+    st.session_state[FRAG_WEIGHTS_KEY] = {n: str(weights_by_name[n].resolve()) for n in names}
 
-    present_classes = {assigned_label_class(dict(r)) for _, r in inventory.iterrows()}
-    class_tab_order = [c for c in CLASS_NAMES if c in present_classes]
-    if "unlabeled" in present_classes:
-        class_tab_order.append("unlabeled")
-
-    st.subheader("Result by CLASS")
-    compare_selection_groups: list[list[str]] = []
-    if not class_tab_order:
-        st.caption("No files to classify.")
-    else:
-        class_tab_display = [c.upper() for c in class_tab_order]
-        class_tabs = st.tabs(class_tab_display)
-        for tab, cls in zip(class_tabs, class_tab_order):
-            with tab:
-                pivot = pivot_for_files(inventory, dp, names, class_filter=cls)
-                if pivot.empty:
-                    st.caption("No files in this class.")
-                    continue
-                st.caption(
-                    f"**{cls}** — {len(pivot)} file(s). "
-                    "**CA** cataract · **DR** diabetic_retinopathy · **GL** glaucoma · **NR** normal."
-                )
-                styled = style_results_pivot(pivot, names, dp)
-                ev = st.dataframe(
-                    styled,
-                    width="stretch",
-                    height=DATAFRAME_VIEW_HEIGHT,
-                    on_select="rerun",
-                    selection_mode="multi-row",
-                    key=f"df_class_{cls}_{mk_slug}",
-                )
-                compare_selection_groups.append(compare_full_paths_from_dataframe_event(pivot, ev))
-    st.session_state.compare_paths = merge_compare_paths_unique(compare_selection_groups)
-
-    st.subheader("Summary")
-    summ_df = model_summary_table(names, files, inventory, dp)
-    sum_labels = list(names)
-    if len(names) > 1:
-        sum_labels.append("all")
-    sum_labels.append(SUMMARY_TAB_PREVIEW)
-    sum_tab_display = [x.upper() for x in sum_labels]
-    display_to_label = dict(zip(sum_tab_display, sum_labels))
-
-    paths_now = list(st.session_state.get("compare_paths") or [])
-    sig_now = tuple(sorted(paths_now))
-    sig_prev = st.session_state.get(COMPARE_PATHS_SIG_KEY)
-    if sig_prev != sig_now:
-        st.session_state[COMPARE_PATHS_SIG_KEY] = sig_now
-        if sig_prev is not None:
-            st.session_state[SUMMARY_TAB_PICK_KEY] = SUMMARY_TAB_PREVIEW.upper()
-
-    sel = st.segmented_control(
-        " ",
-        options=sum_tab_display,
-        selection_mode="single",
-        label_visibility="collapsed",
-        key=SUMMARY_TAB_PICK_KEY,
-        width="stretch",
-    )
-    picked = _summary_segmented_pick(
-        sel,
-        st.session_state.get(SUMMARY_TAB_PICK_KEY),
-        sum_tab_display,
-    )
-    label = display_to_label[picked]
-
-    if label == "all":
-        st.caption("Cross-model summary table and **per-class recall**; confusion heatmaps are on each model tab.")
-        st.dataframe(summ_df, width="stretch", hide_index=True)
-        st.markdown("##### Per-class accuracy by model (recall, %)")
-        pc_df = per_class_recall_by_model_dataframe(names, files, inventory, dp)
-        st.dataframe(pc_df, width="stretch", hide_index=True)
-        st.caption(
-            "Each model column: **%** recall per **actual** (row total in that model’s confusion matrix, "
-            "finished valid predictions). **n_actual** = images with that **actual** in the batch."
-        )
-    elif label == SUMMARY_TAB_PREVIEW:
-        render_compare_blocks(
-            paths_now,
-            inventory,
-            dp,
-            names,
-        )
-    else:
-        row = summ_df[summ_df["model"] == label]
-        if row.empty:
-            st.caption("No data.")
-        else:
-            r = row.iloc[0]
-            mat = confusion_matrix_labeled(files, inventory, dp.get(label, {}))
-            hm_col, stats_col = st.columns([0.36, 0.64], gap="small")
-            with hm_col:
-                render_confusion_heatmap(
-                    mat,
-                    f"{label}\nactual × predicted",
-                    size="mini",
-                )
-            with stats_col:
-                if int(r["total"]) > 0:
-                    done = int(r["inference_ok"]) + int(r["inference_err"])
-                    st.progress(
-                        min(done / int(r["total"]), 1.0),
-                        text=f"Inference: {done} / {int(r['total'])} files",
-                    )
-                st.caption(
-                    "**Correct** and **Accuracy**: vs **actual**. "
-                    f"Runs: {int(r['inference_ok'])} ok, {int(r['inference_err'])} errors."
-                )
-                a, b, c = st.columns(3)
-                with a:
-                    st.metric("Total files", int(r["total"]))
-                with b:
-                    st.metric("Pending", int(r["pending"]))
-                with c:
-                    st.metric("Labeled", int(r["labeled"]))
-                d, e = st.columns(2)
-                with d:
-                    st.metric("Correct", int(r["correct"]))
-                acc = r["accuracy"]
-                with e:
-                    if pd.isna(acc):
-                        st.metric("Accuracy", "—")
-                    else:
-                        st.metric("Accuracy", f"{float(acc) * 100:.1f}%")
-
-    p_run = next_file_needing_predictions(files, names, dp)
-    if p_run is not None:
-        run_deploy_predictions_for_one_file(p_run, names, weights_by_name, dp)
-        st.rerun()
+    _results_summary_fragment()
 
 
 if __name__ == "__main__":

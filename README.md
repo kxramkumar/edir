@@ -19,7 +19,7 @@ EDIR is an automated eye disease classification system that analyzes ocular imag
 | **nbs** | Jupyter notebooks for exploration, preprocessing, and experiments. |
 | **ref** | Reference material (e.g. `brain_tumour.ipynb` as reference for this project). |
 | **src** | Reusable Python package and scripts; importable from notebooks and elsewhere after `uv sync`. |
-| **mode** | Deploy artifacts: put **`effnet_b4_g.pth`** under `mode/effnet_b4_g/` for the Streamlit app **`src/model_deploy.py`**. |
+| **mode** | Deploy artifacts: optional **`mode/<name>/<name>.pth`** for Streamlit **`src/model_deploy.py`** (see **Run Streamlit deploy**). |
 
 ### Data layout (res/)
 
@@ -148,44 +148,46 @@ This runs Jupyter Lab using the project’s virtual environment and dependencies
 
 ## Run Streamlit deploy (`src/model_deploy.py`)
 
-Small web UI for a **single** trained model: **EfficientNet-B4 green-channel** (`effnet_b4_g`), matching the §9.3 pipeline in the notebooks (CLAHE / pseudo-RGB prep + ImageNet-normalized inference).
+Multi-model Streamlit UI: **EfficientNet-B4** fundus prep (green-channel / CLAHE recipe), batch inference, **Result by CLASS**, **Summary**, and **PREVIEW** for selected rows. Models and weight paths are configured in **`MODEL_LIST`** inside `src/model_deploy.py` (defaults expect `.pth` files next to that script under `src/`).
 
-### 1. Weights location (`effnet_b4_g.pth`)
+### Quick start (uv)
 
-The app looks for **`effnet_b4_g.pth`** in this order:
+From the **repository root** (`edir/`):
 
-1. **`EDIR_EFFNET_B4_G_WEIGHTS`** — optional path (absolute or relative to repo root).
-2. **`mode/effnet_b4_g/effnet_b4_g.pth`** — deploy copy next to `src/`.
-3. **`res/<RUN_TAG>/data/model/effnet_b4_g/effnet_b4_g.pth`** — same path the §9.3 notebook uses (e.g. `res/rgb_v1/...`).
+```bash
+uv sync
+uv run streamlit run src/model_deploy.py
+```
 
-So if you already trained with **`RUN_TAG=rgb_v1`**, you usually **do not need to copy** the file; a refresh after `uv run streamlit run src/model_deploy.py` should pick it up.
+Open the URL Streamlit prints (usually `http://localhost:8501`). Use **Setup** to point at an image folder or a single image file.
 
-Optional: copy next to `mode/` for a frozen deploy bundle:
+**Windows (PowerShell)** — same commands from the project root:
 
 ```powershell
-# Windows PowerShell — from project root
+uv sync
+uv run streamlit run src/model_deploy.py
+```
+
+Do **not** run `python src/model_deploy.py` by itself; Streamlit must start the app. Alternatively, activate the project venv (after `uv sync`) and run `streamlit run src/model_deploy.py`.
+
+### Weights (per model)
+
+For each entry in **`MODEL_LIST`**, weights resolve in this order (see `src/model_deploy.py` for details):
+
+1. Optional **`weights`** path in **`MODEL_LIST`** (relative paths are under **`src/`**).
+2. Environment variable **`EDIR_<NAME_UPPER>_WEIGHTS`** (absolute or repo-relative).
+3. **`mode/<name>/<name>.pth`**
+4. **`res/<RUN_TAG>/data/model/<name>/<name>.pth`**
+
+Example: copy or symlink **`effnet_b4_g.pth`** next to `src/model_deploy.py`, or place under `mode/effnet_b4_g/`. If you already trained with **`RUN_TAG=rgb_v1`**, the `res/.../model/...` path often works without copying.
+
+Optional frozen copy (PowerShell):
+
+```powershell
 New-Item -ItemType Directory -Force -Path mode/effnet_b4_g | Out-Null
 Copy-Item res/rgb_v1/data/model/effnet_b4_g/effnet_b4_g.pth mode/effnet_b4_g/effnet_b4_g.pth
 ```
 
-### 2. Install dependencies (uv)
+### Dependencies
 
-From the **project root**, use **`uv sync`** (this is how uv installs your project’s dependencies; there is no separate **`uv install`** for the lockfile/`pyproject.toml` workflow). It creates or updates the virtual environment and installs **everything** listed in `pyproject.toml`, including **Streamlit**, PyTorch, OpenCV, and the rest.
-
-```bash
-uv sync
-```
-
-Run this after clone or whenever `pyproject.toml` changes. To add a new package later, use `uv add <package>` then `uv sync` again.
-
-### 3. Run the app (uv)
-
-Still from the project root — runs Streamlit inside the project environment:
-
-```bash
-uv run streamlit run src/model_deploy.py
-```
-
-Then open the URL Streamlit prints (usually `http://localhost:8501`). Upload a fundus image; the app applies the same **medical-style** preprocessing as training, then shows class probabilities for: cataract, diabetic retinopathy, glaucoma, normal.
-
-**Note:** Run **`model_deploy.py`** only with **`uv run streamlit run …`** (or activate the venv and run `streamlit run src/model_deploy.py`). Do not use `python src/model_deploy.py` alone.
+`uv sync` installs **Streamlit**, PyTorch, OpenCV, and everything in **`pyproject.toml`**. Run it after clone or when dependencies change (`uv add <package>` if you add libraries).
