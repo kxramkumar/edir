@@ -21,6 +21,7 @@ dependencies = [
     "split-folders>=0.5.1",
     "tensorflow>=2.15",
     "scikit-learn>=1.8.0",
+    "xgboost>=2.0.0",
     "torch>=2.11.0",
     "torchvision>=0.26.0",
     "streamlit>=1.37.0",

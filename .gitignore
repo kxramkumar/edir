@@ -23,3 +23,6 @@ res/*/data/aug/*
 !res/*/data/prep/.gitkeep
 !res/*/data/aug/.gitkeep
 res/*/data/model/*
+
+# PyTorch weights next to **src/model_deploy.py** — too large for normal GitHub pushes (use Git LFS, releases, or local paths).
+src/*.pth

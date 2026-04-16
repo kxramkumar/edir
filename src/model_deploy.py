@@ -1,8 +1,6 @@
 """
-Multi-model Streamlit deploy: configure models in **MODEL_LIST** (name + optional weights path).
-
-Each model uses the same EfficientNet-B4 head (**effnet_b4_g** training recipe): green → CLAHE →
-blur → ROI crop → 380×380 pseudo-RGB.
+Multi-model Streamlit deploy: **ResNet-50**, **DenseNet-121**, **EfficientNet-B0** using the same **build_model** and
+**eval_transform** as ``final_eye_disease_classification.ipynb`` (torchvision **Resize** + **ToTensor** + **Normalize**).
 
 Weights: set **``weights``** in **MODEL_LIST** (absolute path, or relative to this file’s directory —
 **``src/``** when the script lives in **``src/``**). If **``weights``** is omitted, resolution falls back to:
@@ -11,7 +9,7 @@ Weights: set **``weights``** in **MODEL_LIST** (absolute path, or relative to th
 2. **mode/<name>/<name>.pth**
 3. **res/<RUN_TAG>/data/model/<name>/<name>.pth**
 
-Layout: **Setup** (path) → **Result by CLASS** (whole-batch inference progress) → **Summary** only after every file has all models scored (Streamlit **fragment**). **Summary** ALL / per-model tabs reuse a session cache for that batch; **PREVIEW** always follows live row selection. One **file** × all models per step until complete. Session cache until path set changes.
+Layout: **Setup** (path) → **Result by CLASS** (updates after **each** file’s inference) → **Summary** only when the full batch is done. Results render inside one **fragment**; while inference is incomplete the fragment chains with ``st.rerun(scope="fragment")`` (no ``run_every`` timer), so the app **stops running** when the batch finishes.
 
 Run from repo root::
 
@@ -26,7 +24,11 @@ import html
 import os
 from pathlib import Path
 
-import cv2
+# PyTorch + NumPy BLAS can oversubscribe CPU threads on Windows; cap before heavy work.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -35,14 +37,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import streamlit as st
-
-try:
-    _st_fragment = st.fragment  # Streamlit >= 1.37: partial reruns for widgets inside the fragment
-except AttributeError:
-
-    def _st_fragment(f):
-        return f
-
+from streamlit.errors import StreamlitAPIException
 
 import torch
 import torch.nn as nn
@@ -56,11 +51,14 @@ DEPLOY_DIR = Path(__file__).resolve().parent
 
 # --- Models: ``name`` + ``weights`` path. Relative ``weights`` resolve under **DEPLOY_DIR** (same folder as this file). ---
 MODEL_LIST: list[dict[str, str | None]] = [
-    {"name": "effnet_b4_g", "weights": str(DEPLOY_DIR / "effnet_b4_g.pth")},
-    {"name": "effnet_b4_rgb", "weights": str(DEPLOY_DIR / "effnet_b4_rgb.pth")},
+    {"name": "resnet_50", "weights": str(DEPLOY_DIR / "resnet_50.pth")},
+    {"name": "densenet_121", "weights": str(DEPLOY_DIR / "densenet_121.pth")},
+    {"name": "efficientnet_b0", "weights": str(DEPLOY_DIR / "efficientnet_b0.pth")},
 ]
 
-IMG_SIZE = 380
+# Same symbols as ``final_eye_disease_classification.ipynb`` (IMAGE_SIZE, DROPOUT).
+IMAGE_SIZE = 224
+DROPOUT = 0.3
 
 CLASS_NAMES = ["cataract", "diabetic_retinopathy", "glaucoma", "normal"]
 NUM_CLASSES = len(CLASS_NAMES)
@@ -84,10 +82,7 @@ COMPARE_PATHS_SIG_KEY = "_compare_paths_sig"
 CLASS_TAB_PICK_KEY = "result_class_tab_pick"
 # Last **Result by CLASS** segment; switching clears that table’s selection and **Preview** paths for a clean reload.
 LAST_RESULT_CLASS_KEY = "_last_result_class_tab"
-# Single **st.empty()** for all **Summary** content below the segmented control (ALL / PREVIEW / per-model).
-# Switches tabs by replacing one subtree so PREVIEW does not stack with confusion-matrix content.
-SUMMARY_BODY_PLACEHOLDER_KEY = "_edir_summary_body_ph"
-# Snapshot for **@st.fragment** reruns (main() does not re-execute on in-fragment widget events).
+# **Summary** tab body uses ``st.container(key=...)`` so switching tabs remounts content cleanly.
 FRAG_INVENTORY_KEY = "_edir_frag_inventory"
 FRAG_NAMES_KEY = "_edir_frag_names"
 FRAG_MK_KEY = "_edir_frag_mk_slug"
@@ -104,8 +99,11 @@ IMAGENET_NORMALIZE = transforms.Normalize(
     std=[0.229, 0.224, 0.225],
 )
 
-TENSOR_TFM = transforms.Compose(
+# Matches ``eval_transform`` in ``final_eye_disease_classification.ipynb``: default ``Resize(224)`` + ``ToTensor`` + ``Normalize``.
+EVAL_RESIZE = transforms.Resize((IMAGE_SIZE, IMAGE_SIZE))
+EVAL_TRANSFORM = transforms.Compose(
     [
+        EVAL_RESIZE,
         transforms.ToTensor(),
         IMAGENET_NORMALIZE,
     ]
@@ -191,6 +189,41 @@ def list_image_files(folder: Path) -> list[Path]:
         if p.is_file() and p.suffix.lower() in IMAGE_EXT:
             out.append(p)
     return sorted(out, key=lambda x: str(x).lower())
+
+
+def validate_folder_has_class_layout(folder: Path, files: list[Path]) -> tuple[bool, str]:
+    """Batch folders must follow ImageFolder-style paths: each image under a directory named in **CLASS_NAMES**."""
+    if not files:
+        return (
+            False,
+            "No images found. Expected subfolders named exactly: **"
+            + "**, **".join(CLASS_NAMES)
+            + "** (e.g. `…/cataract/img.png`), or use a **single image file** path.",
+        )
+    root = folder.resolve()
+    bad: list[str] = []
+    for p in files:
+        try:
+            rel_parts = p.resolve().relative_to(root).parts
+        except ValueError:
+            return False, "Could not resolve file paths relative to the selected folder."
+        dir_parts = rel_parts[:-1]
+        if not any(part in CLASS_NAMES for part in dir_parts):
+            bad.append(str(p))
+    if not bad:
+        return True, ""
+    show = bad[:3]
+    tail = f" (+{len(bad) - 3} more)" if len(bad) > 3 else ""
+    return (
+        False,
+        "Each image must be inside a subfolder named one of: **"
+        + "**, **".join(CLASS_NAMES)
+        + "**. "
+        + f"{len(bad)} file(s) are not (examples: "
+        + ", ".join(f"`{s}`" for s in show)
+        + tail
+        + "). Or choose **one image file** instead of a folder.",
+    )
 
 
 def batch_files_signature(paths: list[Path]) -> str:
@@ -288,54 +321,119 @@ def resolve_weights_path(model_name: str, explicit: str | None) -> tuple[Path | 
     return None, uniq
 
 
-def preprocess_fundus_effnet_b4_g(pil_image: Image.Image) -> Image.Image:
-    rgb = np.asarray(pil_image.convert("RGB"), dtype=np.uint8)
-    green = rgb[:, :, 1]
+def eval_transform_pil(pil_rgb: Image.Image) -> Image.Image:
+    """PIL 224×224 for **display** only; same **EVAL_RESIZE** as inference."""
+    return EVAL_RESIZE(pil_rgb.convert("RGB"))
 
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(green)
-    blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
 
-    _, mask = cv2.threshold(blurred, 10, 255, cv2.THRESH_BINARY)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        cnt = max(contours, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(cnt)
-        blurred = blurred[y : y + h, x : x + w]
+def build_model(model_name: str, num_classes: int, dropout: float = DROPOUT) -> torch.nn.Module:
+    """Same as ``build_model`` in ``final_eye_disease_classification.ipynb`` (``weights=None`` for deploy)."""
+    if model_name == "efficientnet_b0":
+        model = models.efficientnet_b0(weights=None)
+        in_features = model.classifier[1].in_features
+        model.classifier = nn.Sequential(
+            nn.Dropout(p=dropout),
+            nn.Linear(in_features, num_classes),
+        )
+    elif model_name == "densenet121":
+        model = models.densenet121(weights=None)
+        in_features = model.classifier.in_features
+        model.classifier = nn.Sequential(
+            nn.Dropout(p=dropout),
+            nn.Linear(in_features, num_classes),
+        )
+    elif model_name == "resnet50":
+        model = models.resnet50(weights=None)
+        in_features = model.fc.in_features
+        model.fc = nn.Sequential(
+            nn.Dropout(p=dropout),
+            nn.Linear(in_features, num_classes),
+        )
+    else:
+        raise ValueError(f"Unsupported model: {model_name}")
+    return model
 
-    resized = cv2.resize(blurred, (IMG_SIZE, IMG_SIZE))
-    bgr = cv2.merge([resized, resized, resized])
-    rgb_out = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(rgb_out)
+
+def extract_state_dict_from_checkpoint(loaded: object, *, path: Path) -> dict[str, torch.Tensor]:
+    """``.pth`` may be a raw ``state_dict`` or a dict with ``model_state_dict`` / ``state_dict``."""
+    if isinstance(loaded, dict) and "model_state_dict" in loaded:
+        sd = loaded["model_state_dict"]
+    elif isinstance(loaded, dict) and "state_dict" in loaded:
+        sd = loaded["state_dict"]
+    elif isinstance(loaded, dict) and loaded:
+        k0 = next(iter(loaded.keys()))
+        if isinstance(k0, str) and (k0.startswith("features.") or k0.startswith("classifier.")):
+            return loaded  # type: ignore[return-value]
+        raise ValueError(f"Unrecognized checkpoint keys in {path}")
+    else:
+        raise ValueError(f"Expected a dict checkpoint: {path}")
+    if not isinstance(sd, dict):
+        raise ValueError(f"state dict is not a dict: {path}")
+    return sd  # type: ignore[return-value]
+
+
+def _notebook_build_model_name(deploy_name: str) -> str:
+    """Map **MODEL_LIST** ``name`` to ``build_model`` ``model_name`` (``efficientnet_b0`` / ``densenet121`` / ``resnet50``)."""
+    n = deploy_name.strip().lower().replace("-", "_")
+    if n in ("resnet_50", "resnet50"):
+        return "resnet50"
+    if n in ("densenet_121", "densenet121"):
+        return "densenet121"
+    if n in ("efficientnet_b0", "effnet_b0"):
+        return "efficientnet_b0"
+    raise ValueError(f"Unknown model name (expected resnet_50, densenet_121, efficientnet_b0): {deploy_name!r}")
 
 
 @st.cache_resource
-def load_effnet_b4_g(weights_path: str) -> torch.nn.Module:
+def load_model_from_checkpoint(weights_path: str, model_name: str) -> torch.nn.Module:
+    """``torch.load`` + ``model_state_dict`` into ``build_model`` — same pattern as loading best checkpoints in the notebook."""
     path = Path(weights_path)
     if not path.is_file():
         raise FileNotFoundError(f"Weights not found: {path.resolve()}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = models.efficientnet_b4(weights=None)
+    key = _notebook_build_model_name(model_name)
+    model = build_model(key, NUM_CLASSES, DROPOUT)
     for param in model.parameters():
         param.requires_grad = False
-    in_f = model.classifier[1].in_features
-    model.classifier[1] = nn.Linear(in_f, NUM_CLASSES)
-    state = torch.load(str(path), map_location=device)
+    raw = torch.load(str(path), map_location=device, weights_only=False)
+    state = extract_state_dict_from_checkpoint(raw, path=path)
     model.load_state_dict(state)
     model.to(device)
     model.eval()
     return model
 
 
-def predict_proba(model: torch.nn.Module, pil_prep: Image.Image) -> tuple[int, np.ndarray]:
+def load_model_for_name(model_name: str, weights_path: str) -> torch.nn.Module:
+    wp = str(Path(weights_path).resolve())
+    return load_model_from_checkpoint(wp, model_name)
+
+
+def device_from_loaded(loaded: torch.nn.Module) -> torch.device:
+    return next(loaded.parameters()).device
+
+
+def predict_proba(model: torch.nn.Module, x: torch.Tensor) -> tuple[int, np.ndarray]:
+    """``x``: batch **(1, 3, H, W)** from **EVAL_TRANSFORM**(PIL RGB)."""
     device = next(model.parameters()).device
-    x = TENSOR_TFM(pil_prep).unsqueeze(0).to(device)
+    x = x.to(device)
     with torch.no_grad():
         logits = model(x)
         probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
     pred_idx = int(np.argmax(probs))
     return pred_idx, probs
+
+
+def predict_deploy_row(loaded: torch.nn.Module, x: torch.Tensor) -> dict[str, object]:
+    pred_idx, probs = predict_proba(loaded, x)
+    row: dict[str, object] = {
+        "inference_status": "done",
+        "predicted_class": CLASS_NAMES[pred_idx],
+        "predicted_index": pred_idx,
+    }
+    for cname, prob in zip(CLASS_NAMES, probs):
+        row[f"P({cname})"] = float(prob)
+    return row
 
 
 def build_file_inventory_dataframe(folder: Path, paths: list[Path]) -> pd.DataFrame:
@@ -352,22 +450,11 @@ def build_file_inventory_dataframe(folder: Path, paths: list[Path]) -> pd.DataFr
     return pd.DataFrame(rows)
 
 
-def predict_row_from_prepped(model: torch.nn.Module, prepped: Image.Image) -> dict[str, object]:
-    pred_idx, probs = predict_proba(model, prepped)
-    row: dict[str, object] = {
-        "inference_status": "done",
-        "predicted_class": CLASS_NAMES[pred_idx],
-        "predicted_index": pred_idx,
-    }
-    for cname, prob in zip(CLASS_NAMES, probs):
-        row[f"P({cname})"] = float(prob)
-    return row
-
-
-def predict_row_for_file(p: Path, model: torch.nn.Module) -> dict[str, object]:
+def predict_row_for_file(model_name: str, p: Path, weights_path: str) -> dict[str, object]:
+    loaded = load_model_for_name(model_name, str(weights_path))
     image = Image.open(p).convert("RGB")
-    prepped = preprocess_fundus_effnet_b4_g(image)
-    return predict_row_from_prepped(model, prepped)
+    x = EVAL_TRANSFORM(image).unsqueeze(0)
+    return predict_deploy_row(loaded, x)
 
 
 def next_file_needing_predictions(
@@ -425,38 +512,39 @@ def run_deploy_predictions_for_one_file(
     weights_by_name: dict[str, Path],
     deploy_preds: dict[str, dict[str, dict[str, object]]],
 ) -> None:
-    """Fill all missing **model** rows for **one** file (shared preproc)."""
+    """Fill all missing **model** rows for **one** file (shared RGB 224×224 prep per file)."""
     fp = str(p.resolve())
     missing = [n for n in model_names if fp not in deploy_preds.get(n, {})]
     if not missing:
         return
 
-    model_by_name: dict[str, torch.nn.Module | None] = {}
+    loaded_by_name: dict[str, torch.nn.Module | None] = {}
     for n in model_names:
         try:
-            model_by_name[n] = load_effnet_b4_g(str(weights_by_name[n].resolve()))
+            loaded_by_name[n] = load_model_for_name(n, str(weights_by_name[n].resolve()))
         except Exception:
-            model_by_name[n] = None
+            loaded_by_name[n] = None
 
     try:
         pil_o = Image.open(p).convert("RGB")
-        prepped = preprocess_fundus_effnet_b4_g(pil_o)
     except OSError as e:
         err = {"inference_status": "error", "error": str(e)}
         for n in missing:
             deploy_preds.setdefault(n, {})[fp] = dict(err)
         return
 
+    x_batch = EVAL_TRANSFORM(pil_o).unsqueeze(0)
+
     for n in missing:
-        model = model_by_name[n]
-        if model is None:
+        loaded = loaded_by_name[n]
+        if loaded is None:
             deploy_preds.setdefault(n, {})[fp] = {
                 "inference_status": "error",
                 "error": "failed to load model weights",
             }
         else:
             try:
-                deploy_preds.setdefault(n, {})[fp] = predict_row_from_prepped(model, prepped)
+                deploy_preds.setdefault(n, {})[fp] = predict_deploy_row(loaded, x_batch)
             except Exception as e:
                 deploy_preds.setdefault(n, {})[fp] = {
                     "inference_status": "error",
@@ -528,7 +616,10 @@ def format_model_cell_plain(bucket: dict[str, dict[str, object]], fp: str, actua
     if status == "pending":
         return "pending"
     if status == "error":
-        return "error · fail"
+        msg = str(pr.get("error", "failed")).replace("\n", " ").strip()
+        if len(msg) > 100:
+            msg = msg[:97] + "…"
+        return f"error · {msg}"
     items = _softmax_items_sorted(pr)
     if not items:
         return str(pr.get("predicted_class", "—"))
@@ -761,16 +852,15 @@ def render_compare_blocks(
         gt = assigned_label_class(inv)
 
         pil_o: Image.Image | None = None
-        pil_p: Image.Image | None = None
         if p.is_file():
             try:
                 pil_o = Image.open(p).convert("RGB")
-                pil_p = preprocess_fundus_effnet_b4_g(pil_o)
             except OSError:
-                pil_o = pil_p = None
+                pil_o = None
         else:
             st.warning(f"Missing file: `{p}`")
 
+        pil_p = eval_transform_pil(pil_o) if pil_o is not None else None
         for m in model_names:
             c0, c1, c2, c3, c4, c5 = st.columns([2.0, 1.0, 1.2, 2.2, 1.0, 1.0])
             with c0:
@@ -800,6 +890,24 @@ def assigned_label_class(inv_row: dict[str, object]) -> str:
     if c in CLASS_NAMES:
         return c
     return "unlabeled"
+
+
+def _class_segment_display_for_path(
+    p: Path,
+    inventory: pd.DataFrame,
+    class_tab_order: list[str],
+) -> str | None:
+    """``st.segmented_control`` label (e.g. ``CATARACT``) for **p**'s class, or **None** if not in tabs."""
+    fp = str(p.resolve())
+    m = inventory[inventory["full_path"] == fp]
+    if not m.empty:
+        acl = assigned_label_class(dict(m.iloc[0]))
+    else:
+        ic = infer_class_from_path(str(p))
+        acl = ic if ic in CLASS_NAMES else "unlabeled"
+    if acl not in class_tab_order:
+        return None
+    return acl.upper()
 
 
 def build_multi_model_row(
@@ -891,11 +999,10 @@ def paths_from_stored_row_indices(pivot: pd.DataFrame, indices: tuple[int, ...])
     return out
 
 
-def _summary_body_placeholder():
-    """Stable slot for **Summary** panel body (everything below the segment switcher)."""
-    if SUMMARY_BODY_PLACEHOLDER_KEY not in st.session_state:
-        st.session_state[SUMMARY_BODY_PLACEHOLDER_KEY] = st.empty()
-    return st.session_state[SUMMARY_BODY_PLACEHOLDER_KEY]
+def _summary_tab_container_key(label: str) -> str:
+    """ASCII key for ``st.container`` so each Summary tab gets a fresh subtree when switching."""
+    safe = "".join(ch if str(ch).isalnum() or ch in "._-" else "_" for ch in str(label))
+    return f"edir_sm_{safe}"[:120]
 
 
 def style_results_pivot(
@@ -927,29 +1034,37 @@ def style_results_pivot(
     return styler
 
 
-def _results_summary_fragment_impl() -> None:
-    """**Result by CLASS**, **Summary**, and one inference step. Reruns independently of **Setup** (``st.fragment``)."""
+def _render_results_and_summary() -> bool | None:
+    """**Result by CLASS**, **Summary**, and one inference step per call. Returns **inference_complete** or **None** if setup state is missing."""
     inventory = st.session_state.get(FRAG_INVENTORY_KEY)
     if not isinstance(inventory, pd.DataFrame) or inventory.empty:
-        return
+        return None
 
     names_raw = st.session_state.get(FRAG_NAMES_KEY)
     if not isinstance(names_raw, list) or not names_raw:
-        return
+        return None
     names = [str(x) for x in names_raw]
 
     mk_slug = str(st.session_state.get(FRAG_MK_KEY, ""))
     files_raw = st.session_state.get(FRAG_FILES_KEY)
     if not isinstance(files_raw, list):
-        return
+        return None
     files = [Path(str(p)) for p in files_raw]
 
     weights_raw = st.session_state.get(FRAG_WEIGHTS_KEY)
     if not isinstance(weights_raw, dict):
-        return
+        return None
     weights_by_name: dict[str, Path] = {str(k): Path(str(v)) for k, v in weights_raw.items()}
 
     dp = st.session_state.deploy_preds
+    p_next = next_file_needing_predictions(files, names, dp)
+    p_focus = p_next
+    if p_next is not None:
+        run_deploy_predictions_for_one_file(
+            p_next, names, weights_by_name, st.session_state.deploy_preds
+        )
+        dp = st.session_state.deploy_preds
+
     inference_complete = next_file_needing_predictions(files, names, dp) is None
 
     present_classes = {assigned_label_class(dict(r)) for _, r in inventory.iterrows()}
@@ -965,7 +1080,10 @@ def _results_summary_fragment_impl() -> None:
             text=f"Inference (all models, whole batch): {done_batch} / {n_batch} files",
         )
         if not inference_complete:
-            st.caption("**Summary** (metrics, PREVIEW, ALL) appears after every file has been run for every model.")
+            st.caption(
+                "**Summary** (metrics, PREVIEW, ALL) appears after every file has been run for every model. "
+                "The class tab follows the file being inferred and is **locked** until then."
+            )
 
     if not class_tab_order:
         st.caption("No files to classify.")
@@ -973,6 +1091,11 @@ def _results_summary_fragment_impl() -> None:
     else:
         class_tab_display = [c.upper() for c in class_tab_order]
         display_to_class = dict(zip(class_tab_display, class_tab_order))
+
+        if p_focus is not None:
+            seg = _class_segment_display_for_path(p_focus, inventory, class_tab_order)
+            if seg is not None:
+                st.session_state[CLASS_TAB_PICK_KEY] = seg
 
         _ensure_segmented_control_default(CLASS_TAB_PICK_KEY, class_tab_display)
         ctab = st.segmented_control(
@@ -982,6 +1105,7 @@ def _results_summary_fragment_impl() -> None:
             label_visibility="collapsed",
             key=CLASS_TAB_PICK_KEY,
             width="content",
+            disabled=not inference_complete,
         )
         picked_class_d = _summary_segmented_pick(
             ctab,
@@ -991,9 +1115,9 @@ def _results_summary_fragment_impl() -> None:
         picked_cls = display_to_class[picked_class_d]
 
         prev_cls = st.session_state.get(LAST_RESULT_CLASS_KEY)
+        # Stable key per (batch slug, class tab): changing it every inference remounts the grid and can flash blank.
         key_df = f"df_class_{picked_cls}_{mk_slug}"
         if prev_cls is not None and prev_cls != picked_cls:
-            st.session_state.pop(key_df, None)
             st.session_state.compare_paths = []
             st.session_state.pop(COMPARE_PATHS_SIG_KEY, None)
         st.session_state[LAST_RESULT_CLASS_KEY] = picked_cls
@@ -1003,20 +1127,26 @@ def _results_summary_fragment_impl() -> None:
             st.caption("No files in this class.")
             st.session_state.compare_paths = []
         else:
+            _prev_hint = (
+                "**Preview** uses only rows selected in **this** class (switching class clears selection)."
+                if inference_complete
+                else "Class tab **tracks the file being inferred**; you can switch classes after the batch completes."
+            )
             st.caption(
                 f"**{picked_cls}** — {len(pivot)} file(s). "
                 "**CA** cataract · **DR** diabetic_retinopathy · **GL** glaucoma · **NR** normal. "
-                "**Preview** uses only rows selected in **this** class (switching class clears selection)."
+                + _prev_hint
             )
             styled = style_results_pivot(pivot, names, dp)
-            ev = st.dataframe(
-                styled,
-                width="stretch",
-                height=DATAFRAME_VIEW_HEIGHT,
-                on_select="rerun",
-                selection_mode="multi-row",
-                key=key_df,
-            )
+            with st.container(border=False):
+                ev = st.dataframe(
+                    styled,
+                    width="stretch",
+                    height=DATAFRAME_VIEW_HEIGHT,
+                    on_select="rerun",
+                    selection_mode="multi-row",
+                    key=key_df,
+                )
             st.session_state.compare_paths = compare_full_paths_from_dataframe_event(
                 pivot, ev, widget_key=key_df
             )
@@ -1068,9 +1198,7 @@ def _results_summary_fragment_impl() -> None:
         )
         label = display_to_label[picked]
 
-        body_ph = _summary_body_placeholder()
-        body_ph.empty()
-        with body_ph.container():
+        with st.container(key=_summary_tab_container_key(label), border=False):
             if label == "all":
                 st.caption(
                     "Cross-model summary table and **per-class recall**; confusion heatmaps are on each model tab."
@@ -1135,15 +1263,18 @@ def _results_summary_fragment_impl() -> None:
                             else:
                                 st.metric("Accuracy", f"{float(acc) * 100:.1f}%")
 
-    p_run = next_file_needing_predictions(files, names, st.session_state.deploy_preds)
-    if p_run is not None:
-        run_deploy_predictions_for_one_file(
-            p_run, names, weights_by_name, st.session_state.deploy_preds
-        )
-        st.rerun()
+    return inference_complete
 
 
-_results_summary_fragment = _st_fragment(_results_summary_fragment_impl)
+@st.fragment()
+def _render_results_fragment() -> None:
+    """Results + Summary; chain inference with ``st.rerun`` (fragment scope) from this decorated function only."""
+    status = _render_results_and_summary()
+    if status is False:
+        try:
+            st.rerun(scope="fragment")
+        except StreamlitAPIException:
+            st.rerun()
 
 
 def main() -> None:
@@ -1189,8 +1320,8 @@ def main() -> None:
         )
         st.stop()
 
-    first_model = load_effnet_b4_g(str(weights_by_name[names[0]]))
-    device = next(first_model.parameters()).device
+    first_loaded = load_model_for_name(names[0], str(weights_by_name[names[0]]))
+    device = device_from_loaded(first_loaded)
 
     if "compare_paths" not in st.session_state:
         st.session_state.compare_paths = []
@@ -1212,8 +1343,13 @@ def main() -> None:
         path_raw = st.text_input(
             "Image folder or image file path",
             key=BATCH_PATH_INPUT_KEY,
-            placeholder=r"Folder (scanned recursively) or one image file, e.g. C:\data\fundus or C:\data\a.png",
-            help="Paste or type a full path. Folders: all images under it are included. Files: that image only.",
+            placeholder=r"Folder with class subfolders (cataract, …) or one .png/.jpg file",
+            help=(
+                "**Folder:** must contain subfolders named exactly: cataract, diabetic_retinopathy, glaucoma, normal — "
+                "with images inside (any depth under the chosen root). "
+                "A plain folder with images but no class-named parents is rejected. "
+                "**File:** a single image path is always allowed."
+            ),
         )
         path_raw = (path_raw or "").strip()
         path_obj = path_from_user_input(path_raw) if path_raw else None
@@ -1237,7 +1373,14 @@ def main() -> None:
             elif path_obj.is_dir():
                 folder = path_obj
                 files = list_image_files(folder)
-                folder_ok = True
+                layout_ok, layout_msg = validate_folder_has_class_layout(folder, files)
+                if layout_ok:
+                    folder_ok = True
+                else:
+                    with path_feedback.container():
+                        st.warning("Invalid path for batch inference.")
+                        st.markdown(layout_msg)
+                    folder_ok = False
             elif path_obj.is_file():
                 if path_obj.suffix.lower() in IMAGE_EXT:
                     folder = path_obj.parent
@@ -1259,20 +1402,22 @@ def main() -> None:
                 st.error(f"Could not open file: {e}")
                 folder_ok = False
             else:
-                prepped = preprocess_fundus_effnet_b4_g(image)
+                prepped = eval_transform_pil(image)
+                x_preview = EVAL_TRANSFORM(image).unsqueeze(0)
                 st.caption(str(one.resolve()))
                 c1, c2 = st.columns(2)
                 with c1:
                     st.caption("Original")
                     st.image(image, width=PREVIEW_IMAGE_WIDTH)
                 with c2:
-                    st.caption("Preprocessed")
+                    st.caption("Preprocessed (224, same resize as inference)")
                     st.image(prepped, width=PREVIEW_IMAGE_WIDTH)
-                m0 = load_effnet_b4_g(str(weights_by_name[names[0]]))
-                pred_idx, probs = predict_proba(m0, prepped)
-                st.success(f"**{CLASS_NAMES[pred_idx]}** ({names[0]})")
-                for cname, p in zip(CLASS_NAMES, probs):
-                    st.progress(float(p), text=f"{cname}: {float(p) * 100:.1f}%")
+                m0 = load_model_for_name(names[0], str(weights_by_name[names[0]]))
+                row = predict_deploy_row(m0, x_preview)
+                st.success(f"**{row['predicted_class']}** ({names[0]})")
+                for cname in CLASS_NAMES:
+                    pv = float(row[f"P({cname})"])
+                    st.progress(pv, text=f"{cname}: {pv * 100:.1f}%")
 
         if folder_ok and not single_file_mode and not files:
             with path_feedback.container():
@@ -1298,9 +1443,6 @@ def main() -> None:
         st.session_state.pop(SUMMARY_TAB_PICK_KEY, None)
         st.session_state.pop(CLASS_TAB_PICK_KEY, None)
         st.session_state.pop(LAST_RESULT_CLASS_KEY, None)
-        _sum_ph_reset = st.session_state.pop(SUMMARY_BODY_PLACEHOLDER_KEY, None)
-        if _sum_ph_reset is not None:
-            _sum_ph_reset.empty()
         for _fk in (
             FRAG_INVENTORY_KEY,
             FRAG_NAMES_KEY,
@@ -1328,7 +1470,7 @@ def main() -> None:
     st.session_state[FRAG_FILES_KEY] = [str(p.resolve()) for p in files]
     st.session_state[FRAG_WEIGHTS_KEY] = {n: str(weights_by_name[n].resolve()) for n in names}
 
-    _results_summary_fragment()
+    _render_results_fragment()
 
 
 if __name__ == "__main__":

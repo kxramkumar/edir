@@ -148,7 +148,7 @@ This runs Jupyter Lab using the project’s virtual environment and dependencies
 
 ## Run Streamlit deploy (`src/model_deploy.py`)
 
-Multi-model Streamlit UI: **EfficientNet-B4** fundus prep (green-channel / CLAHE recipe), batch inference, **Result by CLASS**, **Summary**, and **PREVIEW** for selected rows. Models and weight paths are configured in **`MODEL_LIST`** inside `src/model_deploy.py` (defaults expect `.pth` files next to that script under `src/`).
+Multi-model Streamlit UI: **ResNet-50**, **DenseNet-121**, and **EfficientNet-B0** (same preprocessing as `final_eye_disease_classification.ipynb`), batch inference, **Result by CLASS**, **Summary**, and **PREVIEW** for selected rows. Model names and weight paths are set in **`MODEL_LIST`** inside `src/model_deploy.py`.
 
 ### Quick start (uv)
 
@@ -159,7 +159,7 @@ uv sync
 uv run streamlit run src/model_deploy.py
 ```
 
-Open the URL Streamlit prints (usually `http://localhost:8501`). Use **Setup** to point at an image folder or a single image file.
+Open the URL Streamlit prints (usually `http://localhost:8501`). Use **Setup** to point at an image folder (ImageFolder-style class subfolders) or a single image file.
 
 **Windows (PowerShell)** — same commands from the project root:
 
@@ -168,25 +168,34 @@ uv sync
 uv run streamlit run src/model_deploy.py
 ```
 
-Do **not** run `python src/model_deploy.py` by itself; Streamlit must start the app. Alternatively, activate the project venv (after `uv sync`) and run `streamlit run src/model_deploy.py`.
+Do **not** run `python src/model_deploy.py` alone for the UI; Streamlit must start the app (`streamlit run …`). After `uv sync`, you can also activate the venv and run `streamlit run src/model_deploy.py`.
 
-### Weights (per model)
+### Download model weights (`.pth` from Google Drive)
 
-For each entry in **`MODEL_LIST`**, weights resolve in this order (see `src/model_deploy.py` for details):
+Large checkpoint files are **not** stored in Git (GitHub size limits). **Download the three PyTorch weights from Google Drive** and place them in **`src/`** next to `model_deploy.py`, using exactly these filenames:
+
+| File | Model |
+|------|--------|
+| `resnet_50.pth` | ResNet-50 |
+| `densenet_121.pth` | DenseNet-121 |
+| `efficientnet_b0.pth` | EfficientNet-B0 |
+
+**Google Drive:** download the three files from the shared folder, then copy them into `src/`.
+
+- **Folder (update with your project link):** [Google Drive — model `.pth` files](https://drive.google.com/drive/folders/REPLACE_WITH_YOUR_FOLDER_ID)
+
+If the link above is still a placeholder, replace `REPLACE_WITH_YOUR_FOLDER_ID` with the real folder ID from the project mentor, or ask for the shared URL.
+
+### Other ways to point to weights (optional)
+
+For each entry in **`MODEL_LIST`**, weights can also resolve in this order (see `src/model_deploy.py`):
 
 1. Optional **`weights`** path in **`MODEL_LIST`** (relative paths are under **`src/`**).
 2. Environment variable **`EDIR_<NAME_UPPER>_WEIGHTS`** (absolute or repo-relative).
 3. **`mode/<name>/<name>.pth`**
 4. **`res/<RUN_TAG>/data/model/<name>/<name>.pth`**
 
-Example: copy or symlink **`effnet_b4_g.pth`** next to `src/model_deploy.py`, or place under `mode/effnet_b4_g/`. If you already trained with **`RUN_TAG=rgb_v1`**, the `res/.../model/...` path often works without copying.
-
-Optional frozen copy (PowerShell):
-
-```powershell
-New-Item -ItemType Directory -Force -Path mode/effnet_b4_g | Out-Null
-Copy-Item res/rgb_v1/data/model/effnet_b4_g/effnet_b4_g.pth mode/effnet_b4_g/effnet_b4_g.pth
-```
+Example: if you trained with **`RUN_TAG=rgb_v1`**, you can copy checkpoints from `res/rgb_v1/data/model/...` into `src/` or under `mode/<name>/` instead of using Google Drive.
 
 ### Dependencies
 
